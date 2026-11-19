@@ -124,16 +124,22 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         session = types.SimpleNamespace(request=lambda *_args, **_kwargs: ProviderResponse())
+        details = {}
         with (
             patch.object(backend, "async_get_clientsession", return_value=session),
             patch.object(backend.aiohttp, "ClientTimeout", create=True),
             patch.object(backend.aiohttp, "ClientError", type("ClientError", (Exception,), {}), create=True),
         ):
             with self.assertRaises(backend.AuralisError) as caught:
-                await bridge.chat("Licht an", "de", "context", "user", dry_run=True)
+                await bridge.chat("Licht an", "de", "context", "user", dry_run=True, details=details)
         self.assertEqual(str(caught.exception), "HTTP 404: model_not_found · Unknown model; token [redigiert] and [redigiert]")
         self.assertEqual(bridge.entries[0]["error"], str(caught.exception))
         self.assertTrue(bridge.entries[0]["test"])
+        self.assertEqual(bridge.entries[0]["diagnostics"], details)
+        self.assertEqual(list(details["selection"]["action_parameters"]), ["turn_on"])
+        self.assertTrue(details["requests"][0]["failed"])
+        self.assertGreaterEqual(details["duration_ms"], details["requests"][0]["duration_ms"])
+        self.assertNotIn("secret2", str(details))
 
     async def test_invalid_stt_test_is_logged(self):
         bridge = self.bridge()
@@ -142,6 +148,30 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.entries[0]["kind"], "stt")
         self.assertTrue(bridge.entries[0]["test"])
         self.assertIn("Ungültige Audiodaten", bridge.entries[0]["error"])
+        details = bridge.entries[0]["diagnostics"]
+        self.assertEqual(details["audio_bytes"], 0)
+        self.assertEqual(details["requests"], [])
+        self.assertGreaterEqual(details["duration_ms"], 0)
+
+    async def test_stt_success_records_audio_and_api_timing(self):
+        bridge = self.bridge()
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                pass
+
+        async def request(kind, *, form):
+            self.assertEqual(kind, "stt")
+            return {"text": "Licht aus"}
+
+        bridge.request = request
+        details = {}
+        with patch.object(backend.aiohttp, "FormData", FormData, create=True):
+            transcript = await bridge.transcribe(b"audio", "audio/wav", "de-DE", True, details=details)
+        self.assertEqual(transcript, "Licht aus")
+        self.assertEqual(bridge.entries[0]["diagnostics"], details)
+        self.assertEqual(details["audio_bytes"], 5)
+        self.assertEqual(details["audio_format"], "audio/wav")
+        self.assertGreaterEqual(details["duration_ms"], details["requests"][0]["duration_ms"])
 
     async def test_tool_loop_dry_run_and_disabled_action(self):
         obj = self.bridge()
@@ -150,7 +180,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             requests.append(payload)
             if len(requests) == 1:
                 return {"choices":[{"message":{"tool_calls":[{"id":"1", "type":"function", "function":{"name":"run_action", "arguments":'{"action":"turn_on","entity_ids":["light.room"],"parameters":{}}'}}]}}]}
-            return {"choices":[{"message":{"content":"<think>private</think>Erledigt"}}]}
+            return {"choices":[{"message":{"content":"<think>private</think>Erledigt"}}], "usage": {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146, "provider_debug": "private"}}
         obj.request = request
         result = await obj.chat("Licht an", "de", "context", "user", dry_run=True)
         self.assertEqual(result["answer"], "Erledigt")
@@ -159,6 +189,15 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(obj.entries[0]["test"])
         self.assertNotIn("unlock", str(requests[0]))
         self.assertNotIn("secret", str(requests[0]))
+        details = result["diagnostics"]
+        self.assertEqual(obj.entries[0]["diagnostics"], details)
+        self.assertEqual(details["selection"]["status"], "matched")
+        self.assertEqual(list(details["selection"]["action_parameters"]), ["turn_on"])
+        self.assertEqual(details["selection"]["entities"][0]["id"], "light.room")
+        self.assertEqual([item["tool_calls"] for item in details["requests"]], [1, 0])
+        self.assertEqual(details["requests"][1]["usage"], {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146})
+        self.assertGreaterEqual(details["duration_ms"], details["selection_ms"])
+        self.assertGreaterEqual(result["tools"][0]["duration_ms"], 0)
 
     async def test_alias_and_room_send_only_intended_target_and_action(self):
         bridge = self.bridge()
@@ -210,6 +249,26 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["tools"][0]["result"]["planned"], targets)
         self.assertNotIn("light.living_", requests[1])
         self.assertIn('"planned": 101', requests[1])
+        self.assertEqual(result["diagnostics"]["selection"]["resolved_targets"], targets)
+        self.assertEqual(result["diagnostics"]["selection"]["entities"][0]["id"], backend.BULK_TARGET)
+
+    def test_collective_room_light_command_and_explicit_single_lamp(self):
+        catalog = [entity("light.bed_one", "Leselampe", "Schlafzimmer", "turn_off"),
+                   entity("light.bed_two", "Deckenlampe", "Schlafzimmer", "turn_off"),
+                   entity("light.bed_off", "Lichtband", "Schlafzimmer", "turn_off", state="off"),
+                   entity("light.bed_disabled", "Stehlampe", "Schlafzimmer", "turn_on"),
+                   entity("light.hall", "Wandlampe", "Flur", "turn_off")]
+        for prompt in ("Schalt das Licht im Schlafzimmer aus", "Schalte im Schlafzimmer das Licht aus", "Turn off the light in the Schlafzimmer"):
+            with self.subTest(prompt=prompt):
+                _, actions, targets, status = backend.select_context(prompt, catalog)
+                self.assertEqual(list(actions), ["turn_off"])
+                self.assertEqual(targets, ["light.bed_one", "light.bed_two"])
+                self.assertEqual(status, "matched")
+        selected, _, targets, _ = backend.select_context("Schalt die Leselampe im Schlafzimmer aus", catalog)
+        self.assertEqual([item["id"] for item in selected], ["light.bed_one"])
+        self.assertEqual(targets, [])
+        for prompt in ("Schalt das Licht im Schlafzimer aus", "Schalt das Licht neben dem Bett im Schlafzimmer aus", "Schalt die Lampe im Schlafzimmer aus"):
+            self.assertEqual(backend.select_context(prompt, catalog)[1], {})
 
     def test_retrieval_status_and_compound_light_commands(self):
         catalog = [entity("light.first", "Ecke", "Wohnzimmer", "turn_on", "turn_off", "light_set"),

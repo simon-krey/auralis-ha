@@ -27,7 +27,9 @@ _DOMAINS = {word: domain for domain, words in _TYPES.items() for word in words.s
 _PLURAL_LIGHTS = frozenset("lichter lampen leuchten lights lamps".split())
 _ALL = re.compile(r"\b(?:alle[nrs]?|samtliche[nrs]?|all|every)\b")
 _GLOBAL = re.compile(r"\b(?:uberall|ueberall|everywhere|im ganzen haus|throughout the house)\b")
-_GENERIC_LIGHT_SWITCH = re.compile(r"(?:(?:bitte|please) )?(?:(?:schalte|mach|turn|switch) )?(?:(?:die|das|the|alle|samtliche|all|every) )?(?:(?:die|the) )?(?:licht|lichter|lampe|lampen|leuchten|light|lights|lamp|lamps) (?:an|ein|aus|on|off|einschalten|ausschalten|anmachen|ausmachen)(?: bitte| please)?")
+_GENERIC_LIGHT_SWITCH = re.compile(r"(?:(?:bitte|please) )?(?:(?:schalte?|mache?|turn|switch) )?(?:(?:die|das|the|alle|samtliche|all|every) )?(?:(?:die|the) )?(?:licht|lichter|lampe|lampen|leuchten|light|lights|lamp|lamps) (?:an|ein|aus|on|off|einschalten|ausschalten|anmachen|ausmachen)(?: bitte| please)?")
+_COLLECTIVE_LIGHT_SWITCH = re.compile(r"\b(?:licht|light)\b")
+_ENGLISH_LIGHT_SWITCH = re.compile(r"(?:please )?(?:turn|switch) (?:on|off) (?:the )?lights?(?: please)?")
 _EXCEPTION = re.compile(r"\b(?:nicht|kein\w*|not|don t|except|ausser|ausgenommen|bis auf|nur wenn|only if|unless|statt|instead|ohne|without)\b")
 _LOCAL_QUALIFIER = re.compile(r"\b(?:neben|zwischen|uber dem|unter dem|auf dem|gegenuber|near|next to|between|above|below|opposite|nur|only)\b")
 _QUESTION = re.compile(r"^(?:ist|sind|war|was|welch\w*|wie|wo|is|are|what|which|how|where|tell me)\b")
@@ -118,7 +120,10 @@ def select_context(prompt, catalog):
     named = [entity for entity in catalog if matches[entity["id"]] & specific]
     global_scope = bool(_GLOBAL.search(text))
     explicit_all = bool(_ALL.search(text))
-    bulk = domains == {"light"} and ((explicit_all and (bool(areas) or global_scope or _GENERIC_LIGHT_SWITCH.fullmatch(text))) or (len(areas) == 1 and not named and bool(words & _PLURAL_LIGHTS)))
+    room_command = " ".join(named_text.split())
+    collective_switch = _COLLECTIVE_LIGHT_SWITCH.search(room_command) and _GENERIC_LIGHT_SWITCH.fullmatch(room_command)
+    room_lights = len(areas) == 1 and not named and (words & _PLURAL_LIGHTS or collective_switch or _ENGLISH_LIGHT_SWITCH.fullmatch(room_command))
+    bulk = domains == {"light"} and ((explicit_all and (bool(areas) or global_scope or _GENERIC_LIGHT_SWITCH.fullmatch(text))) or room_lights)
     candidates = []
     if named or areas or domains:
         for entity in (named if named and not bulk else catalog):
@@ -159,7 +164,8 @@ def select_context(prompt, catalog):
         hints.add("activate")
     actions = {entity["id"]: {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and item["id"] in hints} for entity in candidates}
     if not bulk:
-        return candidates, actions[candidates[0]["id"]], [], "matched"
+        selected = actions[candidates[0]["id"]]
+        return candidates, selected, [], "matched" if selected else "no_action"
 
     available = {action for items in actions.values() for action in items}
     if len(available) != 1:

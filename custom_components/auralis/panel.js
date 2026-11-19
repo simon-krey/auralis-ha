@@ -196,6 +196,7 @@ class AuralisPanel extends HTMLElement {
     try {
       const data = await this.call('test_llm', { prompt: this.$('#test_prompt').value, language: this.$('#llm_language').value });
       result.textContent = data.error ? `Test fehlgeschlagen: ${data.error}` : `Antwort: ${data.answer || 'Keine Antwort'}\nWerkzeuge: ${this.format(data.tools)}`;
+      result.textContent += this.testDiagnostics(data.diagnostics);
     } catch (error) { result.textContent = `Test fehlgeschlagen: ${this.error(error)}`; }
     finally {
       button.disabled = false;
@@ -205,6 +206,62 @@ class AuralisPanel extends HTMLElement {
   format(value) {
     if (value == null || (Array.isArray(value) && !value.length)) return 'Keine';
     return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  }
+  duration(value) {
+    if (!Number.isFinite(value)) return '';
+    return value < 1000 ? `${value} ms` : `${(value / 1000).toLocaleString('de-DE', { maximumFractionDigits: 2 })} s`;
+  }
+  selectionText(selection) {
+    return ({ matched: 'Passende Ziele und Aktionen gefunden', clarify: 'Ziel oder Umfang nicht eindeutig', no_match: 'Kein passendes Ziel mit Aktion', no_action: 'Keine passende freigegebene Aktion', read_only: 'Nur Gerätestatus, keine Aktion', already_set: 'Schon im gewünschten Zustand' })[selection?.status] || '';
+  }
+  offeredActions(selection) {
+    return Object.keys(selection?.action_parameters || {}).join(', ') || 'keine';
+  }
+  testDiagnostics(details) {
+    if (!details) return '';
+    const lines = [];
+    if (Number.isFinite(details.duration_ms)) lines.push(`Verarbeitungszeit: ${this.duration(details.duration_ms)}`);
+    if (details.selection) lines.push(`An das LLM übergebene Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
+    return lines.filter(Boolean).map(line => `\n${line}`).join('');
+  }
+  appendDiagnostics(article, details) {
+    if (!details) return;
+    const selection = details.selection;
+    const timing = [details.model, details.language, Number.isFinite(details.duration_ms) ? `Verarbeitungszeit: ${this.duration(details.duration_ms)}` : ''].filter(Boolean);
+    if (timing.length) {
+      const label = document.createElement('p');
+      label.className = 'meta'; label.textContent = timing.join(' · '); article.append(label);
+    }
+    if (selection) {
+      const summary = document.createElement('p');
+      summary.textContent = `An das LLM übergebene Aktionen: ${this.offeredActions(selection)}${this.selectionText(selection) ? ` · ${this.selectionText(selection)}` : ''}`;
+      article.append(summary);
+    }
+    const disclosure = document.createElement('details');
+    const title = document.createElement('summary'); title.textContent = 'Verarbeitungsdetails'; disclosure.append(title);
+    const values = [];
+    if (Number.isFinite(details.selection_ms)) values.push(['Lokale Auswahl', this.duration(details.selection_ms)]);
+    if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
+    if (selection) {
+      values.push(['Geräte im Modellkontext', selection.entities], ['Aktionsparameter im Modellkontext', selection.action_parameters]);
+      if (selection.resolved_targets?.length) values.push(['Lokal aufgelöste Sammelziele', selection.resolved_targets]);
+    }
+    for (const [index, round] of (details.requests || []).entries()) {
+      const parts = [this.duration(round.duration_ms)];
+      if (typeof round.offered_tools === 'boolean') parts.push(round.offered_tools ? 'Werkzeug angeboten' : 'kein Werkzeug angeboten');
+      if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe angefordert`);
+      if (round.failed) parts.push('fehlgeschlagen');
+      if (round.usage) parts.push(`${[Number.isFinite(round.usage.prompt_tokens) && `${round.usage.prompt_tokens} Eingabe`, Number.isFinite(round.usage.completion_tokens) && `${round.usage.completion_tokens} Ausgabe`, Number.isFinite(round.usage.total_tokens) && `${round.usage.total_tokens} gesamt`].filter(Boolean).join(' / ')} Tokens`);
+      values.push([`API-Anfrage ${index + 1}`, parts.filter(Boolean).join(' · ')]);
+    }
+    for (const [label, value] of values) this.appendHistoryField(disclosure, label, value);
+    if (values.length) article.append(disclosure);
+  }
+  appendHistoryField(container, label, value, error = false) {
+    const field = document.createElement('p');
+    const heading = document.createElement('strong'); heading.textContent = `${label}: `;
+    field.className = error ? 'result error' : 'result';
+    field.append(heading, document.createTextNode(this.format(value))); container.append(field);
   }
   async record() {
     if (this._recorder && this._recorder.state !== 'inactive') { this.stopRecording(); return; }
@@ -274,6 +331,7 @@ class AuralisPanel extends HTMLElement {
       const audio = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1]); reader.onerror = () => reject(new Error('Aufnahme konnte nicht gelesen werden.')); reader.readAsDataURL(blob); });
       const data = await this.call('test_stt', { audio, mime: blob.type, language: this.$('#stt_language').value });
       result.textContent = data.error ? `Test fehlgeschlagen: ${data.error}` : `Transkript: ${data.transcript || 'Kein Text erkannt'}`;
+      result.textContent += this.testDiagnostics(data.diagnostics);
     } catch (error) { result.textContent = `Test fehlgeschlagen: ${this.error(error)}`; }
     finally {
       button.disabled = false;
@@ -290,10 +348,21 @@ class AuralisPanel extends HTMLElement {
       if (!entries.length) list.textContent = 'Keine Einträge vorhanden.';
       for (const entry of entries) {
         const article = document.createElement('article'); article.className = 'history-entry';
-        const head = document.createElement('h3'); head.textContent = `${entry.test ? 'Test' : 'Live'} · ${entry.kind || 'Eintrag'} · ${entry.time || 'Zeit unbekannt'}`; article.append(head);
-        for (const [key, label] of [['input', 'Eingabe'], ['transcript', 'Transkript'], ['answer', 'Antwort'], ['tools', 'Werkzeuge'], ['error', 'Fehler']]) {
+        const date = new Date(entry.time || '');
+        const head = document.createElement('h3'); head.textContent = `${entry.test ? 'Test' : 'Live'} · ${entry.kind?.toUpperCase() || 'Eintrag'} · ${Number.isNaN(date.getTime()) ? 'Zeit unbekannt' : date.toLocaleString('de-DE')}${entry.error ? ' · Fehler' : ''}`; article.append(head);
+        this.appendDiagnostics(article, entry.diagnostics);
+        for (const [key, label] of [['input', 'Eingabe'], ['transcript', 'Transkript'], ['answer', 'Antwort'], ['error', 'Fehler']]) {
           if (entry[key] == null || entry[key] === '') continue;
-          const p = document.createElement('p'); const strong = document.createElement('strong'); strong.textContent = `${label}: `; p.className = key === 'error' || key === 'tools' ? 'result' : ''; p.append(strong, document.createTextNode(this.format(entry[key]))); article.append(p);
+          this.appendHistoryField(article, label, entry[key], key === 'error');
+        }
+        if (entry.tools?.length) {
+          const calls = document.createElement('details');
+          const label = document.createElement('summary'); label.textContent = `Werkzeugaufrufe (${entry.tools.length}${entry.test ? ', Trockenlauf' : ''})`; calls.append(label);
+          for (const call of entry.tools) {
+            const { action, duration_ms, ...data } = call;
+            this.appendHistoryField(calls, [action, this.duration(duration_ms)].filter(Boolean).join(' · '), data);
+          }
+          article.append(calls);
         }
         if (entry.has_audio) {
           const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Audio laden';
@@ -325,6 +394,7 @@ class AuralisPanel extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>
       :host{display:block;color:var(--primary-text-color,#202124);background:var(--primary-background-color,#f5f5f5);font-family:var(--paper-font-body1_-_font-family,Roboto,Arial,sans-serif);min-height:100%;font-size:16px;line-height:1.5}*{box-sizing:border-box}header{height:64px;display:flex;align-items:center;gap:12px;padding:0 24px;background:var(--app-header-background-color,var(--primary-color,#03a9f4));color:var(--app-header-text-color,#fff)}header h1{font-size:20px;font-weight:500;margin:0}main{max-width:1100px;margin:auto;padding:30px 24px 64px}.intro{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:24px}.eyebrow{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--secondary-text-color,#555);margin:0 0 6px}h2{font-size:22px;line-height:1.25;margin:0 0 8px}h3{font-size:16px;margin:0}p{margin:8px 0}.muted,.meta,small{color:var(--secondary-text-color,#555)}.signal{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--divider-color,#ddd);border:1px solid var(--divider-color,#ddd);border-radius:12px;overflow:hidden;margin-bottom:24px}.stage{background:var(--card-background-color,#fff);padding:16px}.stage b{display:block}.stage span{font-size:13px;color:var(--secondary-text-color,#555)}.grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,1fr);gap:20px;align-items:start}.stack{display:grid;gap:20px}.card{background:var(--card-background-color,#fff);border:1px solid var(--divider-color,#ddd);border-radius:12px;padding:22px;min-width:0}.card-head{margin-bottom:18px}.card-head p{font-size:14px}.fields{display:grid;grid-template-columns:1fr 1fr;gap:14px}.wide{grid-column:1/-1}label.field{display:grid;gap:5px;font-size:14px;font-weight:600}input,textarea,select,button{font:inherit;color:inherit}input:not([type=checkbox]),textarea,select{width:100%;border:1px solid var(--divider-color,#aaa);border-radius:6px;background:var(--primary-background-color,#fafafa);padding:10px;min-height:44px}textarea{resize:vertical;min-height:100px}input[type=checkbox]{width:20px;height:20px;accent-color:var(--primary-color,#03a9f4);flex:none}button{min-height:44px;border:1px solid var(--divider-color,#aaa);border-radius:6px;background:var(--card-background-color,#fff);padding:9px 14px;cursor:pointer}button.primary{background:var(--primary-color,#0277bd);color:var(--text-primary-color,#fff);border-color:transparent}button:disabled{opacity:.55;cursor:not-allowed}:focus-visible{outline:3px solid var(--primary-color,#0277bd);outline-offset:2px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.checkrow{display:flex;align-items:center;gap:10px;font-weight:600}.notice{border-left:3px solid var(--primary-color,#03a9f4);padding:4px 0 4px 12px;font-size:14px;overflow-wrap:anywhere}.divider{border:0;border-top:1px solid var(--divider-color,#ddd);margin:20px 0}.result{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}.entity{padding:14px 0;border-top:1px solid var(--divider-color,#ddd)}.entity .meta{font-size:13px;margin:2px 0 8px;overflow-wrap:anywhere}.action{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;cursor:pointer}.action strong{font-size:14px;font-weight:500}.action small{display:block;font-size:12px}.history-entry{border-top:1px solid var(--divider-color,#ddd);padding:15px 0;overflow-wrap:anywhere}.history-entry h3{font-size:14px}.history-entry p{font-size:14px;white-space:pre-wrap}.history-entry audio{max-width:100%}.status{min-height:24px;font-size:14px}.error{color:var(--error-color,#b00020)}.menu{padding:0;width:44px;border:0;background:transparent;color:inherit;font-size:24px}.subheading{font-size:16px;margin:20px 0 12px}@media(max-width:760px){header{padding:0 12px}main{padding:22px 16px 48px}.intro{display:block}.grid{grid-template-columns:1fr}.signal{grid-template-columns:1fr}.stage{padding:12px 16px}.fields{grid-template-columns:1fr}.wide{grid-column:auto}.card{padding:18px}}
       [hidden]{display:none!important}.tabs{display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid var(--divider-color,#ddd);margin-bottom:22px}.tabs button{background:none;border:0;border-bottom:3px solid transparent;border-radius:0}.tabs [aria-selected="true"]{border-bottom-color:var(--primary-color,#0277bd);font-weight:600}.model-controls{margin-top:10px}.model-controls .meta{overflow-wrap:anywhere}
+      .history-entry details{margin:8px 0 12px}.history-entry summary{cursor:pointer;min-height:44px;align-content:center;font-size:14px;font-weight:600}.history-entry details .result{margin:4px 0 12px;padding-inline-start:14px;border-inline-start:2px solid var(--divider-color,#ddd)}
     </style><header><button class="menu" id="menu" type="button" aria-label="Menü öffnen">☰</button><h1>Auralis</h1></header><main>
       <div class="intro"><div><p class="eyebrow">Home Assistant · Verwaltung</p><h2>Deine Sprachbrücke</h2><p class="muted">Dienste verbinden, Aktionen freigeben und Anfragen nachvollziehen.</p></div></div>
       <div class="tabs" role="tablist" aria-label="Auralis">

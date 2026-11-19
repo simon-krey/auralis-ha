@@ -61,6 +61,10 @@ def history_sizes(entries):
     return [len(json.dumps(entry, ensure_ascii=True)) + 2 for entry in entries]
 
 
+def elapsed_ms(started):
+    return round((time.perf_counter() - started) * 1000)
+
+
 def valid_url(url):
     try:
         parts = urlsplit(url)
@@ -205,9 +209,30 @@ class Bridge:
         except Exception as error:
             raise AuralisError(diagnostic(error)) from None
 
-    async def transcribe(self, audio, mime, language, test=False):
+    async def timed_request(self, kind, details, **kwargs):
+        started = time.perf_counter()
+        request = {"offered_tools": bool((kwargs.get("payload") or {}).get("tools"))} if kind == "llm" else {}
+        details["requests"].append(request)
+        try:
+            data = await self.request(kind, **kwargs)
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                counts = {key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens") if type(usage.get(key)) is int and 0 <= usage[key] < 2**31}
+                if counts:
+                    request["usage"] = counts
+            return data
+        except Exception:
+            request["failed"] = True
+            raise
+        finally:
+            request["duration_ms"] = elapsed_ms(started)
+
+    async def transcribe(self, audio, mime, language, test=False, *, details=None):
+        started = time.perf_counter()
+        details = {} if details is None else details
         mime = mime.split(";", 1)[0].strip().lower()
         valid_audio = bool(audio) and len(audio) <= MAX_AUDIO and mime in ("audio/wav", "audio/x-wav", "audio/ogg", "audio/webm", "audio/mpeg", "audio/mp4")
+        details.update(model=self.redact(self.settings["stt_model"]), language=(language or "")[:35], audio_bytes=len(audio), audio_format=mime[:100], requests=[])
         try:
             if not valid_audio:
                 raise AuralisError("Ungültige Audiodaten: leere Aufnahme, ungültiges Format oder mehr als 10 MiB.")
@@ -217,25 +242,33 @@ class Bridge:
                 form.add_field("language", language[:35].split("-")[0])
             extension = {"audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/mp4": "m4a"}.get(mime, mime.split("/")[1])
             form.add_field("file", audio, filename=f"audio.{extension}", content_type=mime)
-            data = await self.request("stt", form=form)
+            data = await self.timed_request("stt", details, form=form)
             if not isinstance(data, dict) or not isinstance(data.get("text"), str):
                 raise AuralisError("In der STT-Antwort fehlt das Textfeld text.")
             transcript = data["text"][:MAX_TEXT]
         except Exception as error:
             detail = self.redact(diagnostic(error))
-            await self.record("stt", test, audio if valid_audio else None, mime, error=detail)
+            details["duration_ms"] = elapsed_ms(started)
+            await self.record("stt", test, audio if valid_audio else None, mime, error=detail, diagnostics=details)
             raise AuralisError(detail) from None
-        await self.record("stt", test, audio, mime, transcript=transcript)
+        details["duration_ms"] = elapsed_ms(started)
+        await self.record("stt", test, audio, mime, transcript=transcript, diagnostics=details)
         return transcript
 
-    async def chat(self, prompt, language, context, user, dry_run=False):
+    async def chat(self, prompt, language, context, user, dry_run=False, *, details=None):
+        started = time.perf_counter()
+        details = {} if details is None else details
+        details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[])
         results = []
         try:
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_TEXT:
                 raise AuralisError("Eine Eingabe mit 1 bis 16.000 Zeichen ist erforderlich.")
+            selection_started = time.perf_counter()
             policy = self.policy()
             candidates, enabled, bulk_targets, selection = select_context(prompt, policy.catalog(user=user, for_retrieval=True))
             inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates]
+            details["selection_ms"] = elapsed_ms(selection_started)
+            details["selection"] = {"status": selection, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets}
             allowed_ids = [entity["id"] for entity in inventory] if enabled else []
             inventory_text = json.dumps({"entities": inventory, "action_parameters": enabled}, ensure_ascii=False, separators=(",", ":"))
             if len(inventory_text) > 100000: raise AuralisError("Geräteliste zu groß für die LLM-Anfrage.")
@@ -259,13 +292,15 @@ class Bridge:
                 payload = {"model": self.settings["llm_model"], "messages":messages}
                 if tools and round_index < 3:
                     payload["tools"] = tools
-                data = await self.request("llm", payload=payload)
+                data = await self.timed_request("llm", details, payload=payload)
                 msg = data["choices"][0]["message"]
                 calls = msg.get("tool_calls") or []
+                details["requests"][-1]["tool_calls"] = len(calls)
                 if not calls:
                     answer = clean(msg.get("content") or "")
-                    await self.record("llm", dry_run, input=prompt, answer=answer, tools=results)
-                    return {"answer": answer, "tools": results}
+                    details["duration_ms"] = elapsed_ms(started)
+                    await self.record("llm", dry_run, input=prompt, answer=answer, tools=results, diagnostics=details)
+                    return {"answer": answer, "tools": results, "diagnostics": details}
                 if round_index == 3 or len(calls) > 8 or (bulk_targets and (results or len(calls) != 1)): raise AuralisError("Zu viele Werkzeugaufrufe in der Anbieterantwort.")
                 messages.append({"role":"assistant", "content":None, "tool_calls":calls})
                 for call in calls:
@@ -276,6 +311,7 @@ class Bridge:
                     params = args.get("parameters")
                     if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or len(ids) != 1 or ids[0] not in allowed_ids or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
                         raise AuralisError("Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf.")
+                    tool_started = time.perf_counter()
                     if bulk_targets:
                         ids = bulk_targets
                         result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
@@ -287,10 +323,11 @@ class Bridge:
                         result = await policy.run(action, ids, params, context, dry_run=dry_run, user=user)
                     logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
                     visible_result = {key: len(items) for key, items in result.items()} if bulk_targets else result | {"errors": [{key: value for key, value in error.items() if key != "detail"} for error in result.get("errors", [])]}
-                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result})
+                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "duration_ms":elapsed_ms(tool_started)})
                     messages.append({"role":"tool", "tool_call_id":call["id"], "content":json.dumps(visible_result, ensure_ascii=False)[:MAX_TEXT]})
             raise AuralisError("Zu viele Werkzeugrunden ohne finale LLM-Antwort.")
         except Exception as error:
             detail = self.redact(diagnostic(error))
-            await self.record("llm", dry_run, input=prompt[:MAX_TEXT], tools=results, error=detail)
+            details["duration_ms"] = elapsed_ms(started)
+            await self.record("llm", dry_run, input=prompt[:MAX_TEXT] if isinstance(prompt, str) else "", tools=results, error=detail, diagnostics=details)
             raise AuralisError(detail) from None
