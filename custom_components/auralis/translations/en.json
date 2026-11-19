@@ -1,0 +1,13 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "Auralis is already set up."
+    },
+    "step": {
+      "user": {
+        "title": "Auralis",
+        "description": "Set up Auralis. Configure your speech and language model providers in the sidebar afterwards."
+      }
+    }
+  }
+}
