@@ -288,6 +288,8 @@ class AuralisPanel extends HTMLElement {
       values.push(['Modus', selection.mode], ['Vollständiger passender Umfang', selection.matched_scope], ['Lokale Auswahl', selection.entities], ['Katalog im Modellkontext', selection.catalog_entities], ['Aktive Aktionen', selection.active_actions ?? selection.action_parameters]);
       if (selection.matches) {
         values.push(['Erkannte Räume', selection.matches.rooms], ['Erkannte Gerätenamen', selection.matches.names]);
+        const reason = { read_only_expression: 'Frage, Negation oder Zeitbedingung', unresolved_number_list: 'Nicht aufgelöste Nummernliste', unresolved_room: 'Raum nicht erkannt', unresolved_target: 'Ziel nicht eindeutig erkannt' }[selection.matches.reason];
+        if (reason) values.push(['Grund der lokalen Auswahl', reason]);
         if (selection.matches.skipped_groups?.length) values.push(['Übersprungene Gruppen', selection.matches.skipped_groups]);
       }
       if (selection.resolved_targets?.length) values.push(['Lokal aufgelöste Sammelziele', selection.resolved_targets]);

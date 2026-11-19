@@ -1,8 +1,9 @@
 """Local selection of entities and actions before a model request."""
 
 import re
+from difflib import SequenceMatcher
 
-from .names import EXPLICIT_LOCATION, MATCH_METHODS, match_names, normalize, remove_location
+from .names import EXPLICIT_LOCATION, MATCH_METHODS, match_names, normalize, number_words, remove_location
 
 BULK_TARGET = "__all_matching__"
 _TYPES = {
@@ -31,7 +32,9 @@ _GENERIC_LIGHT_SWITCH = re.compile(r"(?:(?:bitte|please) )?(?:(?:schalte?|mache?
 _COLLECTIVE_LIGHT_SWITCH = re.compile(r"\b(?:licht|light|beleuchtung)\b")
 _ENGLISH_LIGHT_SWITCH = re.compile(r"(?:please )?(?:turn|switch) (?:on|off) (?:the )?lights?(?: please)?")
 _COURTESY = re.compile(r"^(?:(?:kannst|konntest|wurdest|magst) du|(?:can|could|would) you)(?: (?:bitte|please|mal|mir|kurz))* ")
-_EXCEPTION = re.compile(r"\b(?:nicht|kein\w*|not|don t|except|ausser|ausgenommen|bis auf|wenn|falls|sobald|if|unless|statt|instead|ohne|without)\b")
+_EXCEPTION = re.compile(r"\b(?:nicht|nie|niemals|kein\w*|not|never|neither|nor|don t|doesn t|do not|except|ausser|ausgenommen|bis auf|wenn|falls|sobald|if|unless|statt|instead|ohne|without)\b")
+_NUMBER_LIST = re.compile(r"\b\d+\s+(?:(?:und|and|bis|to|through|oder|or)\s+(?:\w+\s+){0,3})?\d+\b")
+_FILLER = frozenset("bitte please mal ma kurz mir kannst konntest wurdest magst du can could would you schalt schalte schalten mach mache machen turn switch set stell stelle auf an ein aus on off im in am der dem den die das the a an des von my mein meine den zum zur und and alle all every samtliche prozent percent grad degrees sie es it im ganzen haus everywhere throughout house".split())
 _LOCAL_QUALIFIER = re.compile(r"\b(?:neben|zwischen|uber dem|unter dem|auf dem|gegenuber|near|next to|between|above|below|opposite|nur|only)\b")
 _DEFERRED = re.compile(r"\b(?:spater|nachher|morgen|later|tomorrow|um \d+|in \d+ (?:sekunden|minuten|stunden|seconds?|minutes?|hours?))\b")
 _QUESTION = re.compile(r"^(?:ist|sind|war|was|welch\w*|wie|wo|is|are|what|which|how|where|tell me)\b")
@@ -86,12 +89,16 @@ def _matches_domain(entity, domains, words):
 
 
 def select_context(prompt, catalog, *, trace=None, language="de"):
-    original = normalize(prompt)
     german = (language or "de").lower().split("-")[0].split("_")[0] == "de"
+    def normalize_name(value):
+        normalized = normalize(value)
+        return number_words(normalized) if german else normalized
+
+    original = normalize_name(prompt)
     rooms = {}
     for entity in catalog:
         if entity["area"]:
-            rooms.setdefault(entity.get("area_id", entity["area"]), set()).update(normalize(value) for value in (entity["area"], *entity.get("area_aliases", ())) if value)
+            rooms.setdefault(entity.get("area_id", entity["area"]), set()).update(normalize_name(value) for value in (entity["area"], *entity.get("area_aliases", ())) if value)
     room_prefixes = {phrase for phrases in rooms.values() for phrase in phrases if phrase and " " not in phrase}
     prefix_lengths = sorted({len(phrase) for phrase in room_prefixes})
     compounds = {word: f"{word[:split]} {word[split:]}" for word in set(original.split()) for split in prefix_lengths if word[:split] in room_prefixes and word[split:] in _DOMAINS}
@@ -107,7 +114,7 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     if domains & {"climate", "light"} and not words & {"sensor", "sensoren"}:
         domains.discard("sensor")
     scoped = [entity for entity in catalog if not areas or entity.get("area_id", entity["area"]) in areas]
-    names = {entity["id"]: {normalize(value) for value in (entity["name"], entity["id"], *entity.get("aliases", ()))} for entity in scoped}
+    names = {entity["id"]: {normalize_name(value) for value in (entity["name"], entity["id"], *entity.get("aliases", ()))} for entity in scoped}
     matches = match_names(named_text, names, generic=_DOMAINS.keys() | room_phrases, german=german)
     specific = {phrase for group in matches.values() for _, phrase in group}
     named = [entity for entity in scoped if entity["id"] in matches]
@@ -145,11 +152,40 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     if "light_set" in hints and "turn_off" not in hints:
         hints.discard("turn_on")
     if _QUESTION.search(text) or _EXCEPTION.search(text) or _DEFERRED.search(action_text):
+        if trace is not None:
+            trace["reason"] = "read_only_expression"
         return candidates, {}, [], "read_only"
+    if _NUMBER_LIST.search(text):
+        if trace is not None:
+            trace["reason"] = "unresolved_number_list"
+        return candidates[:3], {}, [], "clarify"
     if re.search(r"\b(?:maybe|perhaps|possibly|vielleicht|eventuell|irgend\w*|somewhere|somehow)\b", text):
         return candidates, {}, [], "clarify"
-    if len(areas) > 1 or (not global_scope and EXPLICIT_LOCATION.search(named_text)):
+    if not global_scope and (EXPLICIT_LOCATION.search(named_text) or re.search(r"\b(?:im|in|inside)\b", named_text)):
+        if trace is not None:
+            trace["reason"] = "unresolved_room"
+        return [], {}, [], "clarify"
+    if len(areas) > 1:
         return candidates, {}, [], "clarify"
+    # Only unmatched words suggest an unknown target; never turn these suggestions into actions.
+    if not named and (hints or explicit_all or domains or areas):
+        remainder = text
+        for phrase in sorted(room_phrases, key=len, reverse=True):
+            remainder = re.sub(rf"\b{re.escape(phrase)}\b", " ", remainder)
+        for pattern in _ACTION_PATTERNS.values():
+            remainder = pattern.sub(" ", remainder)
+        unknown = [word for word in remainder.split() if word not in _FILLER and word not in _DOMAINS and not word.isdigit()][:20]
+        numbered = bool(re.search(r"\b\d+\b", remainder)) and not (words & {"prozent", "percent", "grad", "degree", "degrees"} or "%" in prompt)
+        if unknown or numbered:
+            pool = [entity for entity in scoped if _matches_domain(entity, domains, words)]
+            def score(entity):
+                variants = names[entity["id"]]
+                return max((SequenceMatcher(None, word, part).ratio() for word in unknown for variant in variants for part in variant.split() if len(word) >= 3), default=0)
+            ranked = sorted(((score(entity), entity) for entity in pool), key=lambda item: (-item[0], item[1]["id"]))
+            suggestions = [entity for similarity, entity in ranked if areas or domains or similarity >= 0.5][:3]
+            if trace is not None:
+                trace["reason"] = "unresolved_target"
+            return suggestions, {}, [], "clarify"
     if (not named and (_LOCAL_QUALIFIER.search(text) or (areas and not domains))) or {"turn_on", "turn_off"} <= hints:
         return candidates, {}, [], "clarify"
     if bulk:

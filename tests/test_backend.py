@@ -450,7 +450,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             content = payload["messages"][0]["content"]
             self.assertIn('"fan.obscure"', content)
             self.assertIn('"turn_on"', content)
-            self.assertNotIn('"action_parameters"', content)
+            self.assertIn('"local_selection"', content)
             if payload["messages"][1]["content"].startswith("Which"):
                 self.assertNotIn("tools", payload)
                 return {"choices": [{"message": {"content": "Lamp is on"}}]}
@@ -461,23 +461,49 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await bridge.chat("Turn off Desk Lamp", "en", "context", "user", dry_run=True)
         self.assertEqual(len(policy.calls), 1)
 
-    async def test_full_unmatched_request_can_use_catalog_pair(self):
+    async def test_full_unmatched_request_cannot_use_catalog_pair(self):
         bridge = self.bridge()
         bridge.settings["llm_full_context"] = True
         policy = Policy()
         policy.entities = [entity("fan.hidden", "Hidden", None, "turn_on")]
         bridge.policy = lambda: policy
-        calls = 0
         async def request(_kind, *, payload):
-            nonlocal calls
-            calls += 1
             self.assertIn('"fan.hidden"', payload["messages"][0]["content"])
-            if calls == 1:
-                return tool_response("turn_on", "fan.hidden")
-            return {"choices": [{"message": {"content": "Done"}}]}
+            self.assertNotIn("tools", payload)
+            return tool_response("turn_on", "fan.hidden")
         bridge.request = request
-        await bridge.chat("Start the breeze device", "en", "context", "user", dry_run=True)
-        self.assertEqual(policy.calls[0][0:2], ("turn_on", ["fan.hidden"]))
+        with self.assertRaises(backend.AuralisError):
+            await bridge.chat("Start the breeze device", "en", "context", "user", dry_run=True)
+        self.assertFalse(policy.calls)
+
+    async def test_full_context_only_executes_local_action_and_target(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity("switch.one", "One", None, "turn_on", "turn_off"),
+                           entity("switch.two", "Two", None, "turn_on")]
+        bridge.policy = lambda: policy
+        for action, target in (("turn_on", "switch.two"), ("turn_off", "switch.one")):
+            async def invalid(_kind, *, payload):
+                props = payload["tools"][0]["function"]["parameters"]["properties"]
+                self.assertEqual(props["action"]["enum"], ["turn_on"])
+                self.assertEqual(props["entity_ids"]["items"]["enum"], ["switch.one"])
+                return tool_response(action, target)
+            bridge.request = invalid
+            with self.assertRaises(backend.AuralisError):
+                await bridge.chat("Turn on One", "en", "context", "user", dry_run=True)
+            self.assertFalse(policy.calls)
+
+        requests = 0
+        async def valid(_kind, *, payload):
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                return tool_response("turn_on", "switch.one")
+            return {"choices": [{"message": {"content": "Done"}}]}
+        bridge.request = valid
+        await bridge.chat("Turn on One", "en", "context", "user", dry_run=True)
+        self.assertEqual(policy.calls[0][0:2], ("turn_on", ["switch.one"]))
 
     async def test_full_read_only_rejects_unoffered_tool(self):
         bridge = self.bridge()

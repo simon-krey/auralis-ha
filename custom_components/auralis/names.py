@@ -6,6 +6,7 @@ from collections import defaultdict
 from itertools import groupby
 
 _WORDS = re.compile(r"[a-z0-9]+")
+_NUMBER_WORDS = dict(zip("null eins zwei drei vier funf sechs sieben acht neun zehn elf zwolf".split(), map(str, range(13))))
 _LOCATION = r"(?:im|in(?: dem| der| the)?|am|at(?: the)?|inside(?: the)?)"
 LOCATION_PREFIX = re.compile(rf"\b{_LOCATION} $")
 EXPLICIT_LOCATION = re.compile(r"\b(?:im|in dem|in der|in the|inside the)\b")
@@ -14,6 +15,10 @@ EXPLICIT_LOCATION = re.compile(r"\b(?:im|in dem|in der|in the|inside the)\b")
 def normalize(value):
     decomposed = unicodedata.normalize("NFKD", value.casefold())
     return " ".join(_WORDS.findall("".join(char for char in decomposed if not unicodedata.combining(char))))
+
+
+def number_words(value):
+    return " ".join(_NUMBER_WORDS.get(word, word) for word in value.split())
 
 
 def contains(text, phrase):
@@ -91,7 +96,11 @@ def _specific(matches):
 
 
 def match_names(text, names, *, rooms=False, generic=(), german=True):
-    exact = {key: {(0, variant) for variant in variants if variant not in generic and contains(text, variant)} for key, variants in names.items()}
+    def exact_match(variant):
+        # A bare name followed by a number can refer to a different numbered device.
+        return bool(variant and re.search(rf"(?<!\w){re.escape(variant)}(?!\w)(?! \d+\b)", text))
+
+    exact = {key: {(0, variant) for variant in variants if variant not in generic and exact_match(variant)} for key, variants in names.items()}
     exact = {key: matches for key, matches in exact.items() if matches}
     if exact:
         return _specific(exact)
@@ -105,7 +114,7 @@ def match_names(text, names, *, rooms=False, generic=(), german=True):
             for end in range(start + 1, min(len(words), start + 5) + 1):
                 phrase = " ".join(words[start:end])
                 compact = "".join(words[start:end])
-                if 4 <= len(compact) <= 48 and phrase not in generic:
+                if 4 <= len(compact) <= 48 and phrase not in generic and not (end < len(words) and words[end].isdigit()):
                     joined[compact].add(phrase)
                     if not rooms or explicit:
                         digits = tuple(re.findall(r"\d+", compact))
