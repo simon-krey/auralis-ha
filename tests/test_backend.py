@@ -116,6 +116,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_error_is_redacted_and_saved_for_tests(self):
         bridge = self.bridge()
         await bridge.save({"llm_url": "https://example.test/v1?api_key=private-query", "llm_model": "chat-a"})
+        prompt = "A" * 3500 + " secret2 private-query, Bearer credential; Ende."
 
         async def chunks(_size):
             yield b'{"error":{"code":"model_not_found","message":"Unknown model; token secret2 and private-query"}}'
@@ -138,13 +139,19 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend.aiohttp, "ClientError", type("ClientError", (Exception,), {}), create=True),
         ):
             with self.assertRaises(backend.AuralisError) as caught:
-                await bridge.chat("Licht an", "de", "context", "user", dry_run=True, details=details)
+                await bridge.chat(prompt, "de", "context", "user", dry_run=True, details=details)
         self.assertEqual(str(caught.exception), "HTTP 404: model_not_found · Unknown model; token [redigiert] and [redigiert]")
         self.assertEqual(bridge.entries[0]["error"], str(caught.exception))
         self.assertTrue(bridge.entries[0]["test"])
         self.assertEqual(bridge.entries[0]["diagnostics"], details)
-        self.assertEqual(list(details["selection"]["action_parameters"]), ["turn_on"])
         self.assertTrue(details["requests"][0]["failed"])
+        request = details["requests"][0]["request"]
+        self.assertEqual(request["endpoint"], "https://example.test/v1/chat/completions")
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["body"]["messages"][-1]["content"], "A" * 3500 + " [redigiert] [redigiert], Bearer [redigiert]; Ende.")
+        self.assertEqual(bridge.entries[0]["input"], request["body"]["messages"][-1]["content"])
+        self.assertNotIn("credential", str(details))
+        self.assertNotIn("private-query", str(details))
         self.assertGreaterEqual(details["duration_ms"], details["requests"][0]["duration_ms"])
         self.assertNotIn("secret2", str(details))
 
@@ -178,6 +185,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.entries[0]["diagnostics"], details)
         self.assertEqual(details["audio_bytes"], 5)
         self.assertEqual(details["audio_format"], "audio/wav")
+        self.assertEqual(details["requests"][0]["request"]["body"], {
+            "model": "whisper-1", "language": "de", "file": {"filename": "audio.wav", "content_type": "audio/wav", "bytes": 5},
+        })
         self.assertGreaterEqual(details["duration_ms"], details["requests"][0]["duration_ms"])
 
     async def test_tool_loop_dry_run_and_disabled_action(self):
@@ -208,6 +218,10 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(details["requests"][1]["usage"], {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146})
         self.assertEqual(details["requests"][0]["reasoning"], "Ich prüfe [redigiert] vor dem Aufruf")
         self.assertEqual(details["requests"][1]["reasoning"], "private")
+        first, second = [item["request"]["body"] for item in details["requests"]]
+        self.assertEqual([message["role"] for message in first["messages"]], ["system", "user"])
+        self.assertEqual(first["tools"], requests[0]["tools"])
+        self.assertEqual([message["role"] for message in second["messages"]], ["system", "user", "assistant", "tool"])
         self.assertEqual([details["requests"][0]["sequence"], result["tools"][0]["sequence"], details["requests"][1]["sequence"]], [1, 2, 3])
         self.assertNotIn("Ich prüfe", str(requests[1]["messages"]))
         self.assertGreaterEqual(details["duration_ms"], details["selection_ms"])
@@ -337,6 +351,40 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         result = await bridge.chat("Kannst du bitte das Licht im Schlaf Zimmer aus machen?", "de", "context", "user", dry_run=True)
         self.assertEqual(policy.calls, [("turn_off", ["light.bed_main", "light.bed_side"], {})])
         self.assertEqual(result["diagnostics"]["selection"]["matches"]["rooms"], [{"id": "bedroom", "heard": "schlaf zimmer", "method": "word_join"}])
+
+    async def test_colloquial_room_command_and_already_off_from_screenshots(self):
+        bridge = self.bridge()
+        policy = Policy()
+        desk = entity("light.schreibtisch_lampe", "Schreibtischlampe", "Schlafzimmer Theo", "turn_off", "turn_on", state="off")
+        ceiling = entity("light.deckenlampe", "Deckenlampe", "Schlafzimmer Theo", "turn_off")
+        policy.entities = [desk, ceiling, entity("light.hall", "Flurlampe", "Flur", "turn_off")]
+        bridge.policy = lambda: policy
+        payloads = []
+
+        async def request(_kind, *, payload):
+            payloads.append(payload)
+            return confirmation_response(approved=True)
+
+        bridge.request = request
+        room_prompt = "Mach ma licht in Schlafzimmer Theo aus."
+        result = await bridge.chat(room_prompt, "de", "context", "user", dry_run=True)
+        self.assertEqual(result["diagnostics"]["selection"]["resolved_targets"], [ceiling["id"]])
+        self.assertEqual(policy.calls, [("turn_off", [ceiling["id"]], {})])
+        ceiling["state"] = "off"
+        for prompt, answer in (("Mach die Schreibtischlampe aus.", "Die Lampe ist schon aus."),
+                               (room_prompt, "Die Lampen sind schon aus.")):
+            with self.subTest(prompt=prompt):
+                result = await bridge.chat(prompt, "de", "context", "user", dry_run=True)
+                self.assertEqual(result["answer"], answer)
+                self.assertEqual(result["diagnostics"]["selection"]["status"], "already_set")
+                self.assertEqual(result["diagnostics"]["requests"], [])
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(len(policy.calls), 1)
+
+        result = await bridge.chat("Mach die Schreibtisch schlampe an.", "de", "context", "user", dry_run=True)
+        selection = result["diagnostics"]["selection"]
+        self.assertEqual(selection["matches"]["names"][0]["method"], "phonetic")
+        self.assertEqual(policy.calls[-1], ("turn_on", [desk["id"]], {}))
 
     async def test_prepared_actions_require_a_boolean_and_an_unchanged_plan(self):
         for response, state in (

@@ -121,6 +121,7 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
         room_command = re.sub(rf"\b{re.escape(phrase)}\b", " ", room_command)
     room_command = _COURTESY.sub("", " ".join(room_command.split()))
     room_command = " ".join(word for word in room_command.split() if word not in {"bitte", "please", "mal", "kurz", "mir"})
+    room_command = re.sub(r"^((?:schalte?|mache?) )ma ", r"\1", room_command)
     collective_switch = _COLLECTIVE_LIGHT_SWITCH.search(room_command) and _GENERIC_LIGHT_SWITCH.fullmatch(room_command)
     room_lights = len(areas) == 1 and not named and (words & _PLURAL_LIGHTS or collective_switch or _ENGLISH_LIGHT_SWITCH.fullmatch(room_command))
     bulk = domains == {"light"} and ((explicit_all and (bool(areas) or global_scope or _GENERIC_LIGHT_SWITCH.fullmatch(text))) or room_lights)
@@ -165,16 +166,21 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     approximate = any(min(group)[0] >= 2 for group in (*area_matches.values(), *matches.values()))
     actions = {entity["id"]: {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and item["id"] in hints and not (approximate and item.get("sensitive"))} for entity in candidates}
     if not bulk:
-        selected = actions[candidates[0]["id"]]
+        candidate = candidates[0]
+        selected = actions[candidate["id"]]
+        desired_action = {"off": "turn_off", "on": "turn_on"}.get(candidate["state"])
+        if _domain(candidate) == "light" and not candidate.get("group") and selected.keys() == {desired_action}:
+            return candidates, {}, [], "already_set"
         return candidates, selected, [], "matched" if selected else "no_action"
 
     available = {action for items in actions.values() for action in items}
     if len(available) != 1:
         return [], {}, [], "clarify" if available else "no_match"
     action = next(iter(available))
-    targets = [entity["id"] for entity in candidates if action in actions[entity["id"]] and (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
-    if not targets:
-        return [], {}, [], "already_set"
-    schema = actions[targets[0]][action]
+    eligible = [entity for entity in candidates if action in actions[entity["id"]]]
+    targets = [entity["id"] for entity in eligible if (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
     selection = {"id": BULK_TARGET, "name": "Alle passenden Lampen", "area": candidates[0]["area"] if areas else None, "count": len(targets)}
+    if not targets:
+        return [selection | {"state": eligible[0]["state"], "count": len(eligible)}], {}, [], "already_set"
+    schema = actions[targets[0]][action]
     return [selection], {action: schema}, targets, "matched"

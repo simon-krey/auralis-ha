@@ -268,18 +268,32 @@ class AuralisPanel extends HTMLElement {
       if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe angefordert`);
       if (round.failed) parts.push('fehlgeschlagen');
       if (round.usage) parts.push(`${[Number.isFinite(round.usage.prompt_tokens) && `${round.usage.prompt_tokens} Eingabe`, Number.isFinite(round.usage.completion_tokens) && `${round.usage.completion_tokens} Ausgabe`, Number.isFinite(round.usage.total_tokens) && `${round.usage.total_tokens} gesamt`].filter(Boolean).join(' / ')} Tokens`);
-      timeline.push({ start: round.started_ms, sequence: round.sequence, title: `API-Anfrage ${index + 1}`, value: parts.filter(Boolean).join(' · '), reasoning: round.reasoning });
+      timeline.push({ start: round.started_ms, sequence: round.sequence, title: `API-Anfrage ${index + 1}`, value: parts.filter(Boolean).join(' · '), round });
     }
     for (const call of tools || []) {
       if (Number.isFinite(call.started_ms)) timeline.push({ start: call.started_ms, sequence: call.sequence, title: `Werkzeug: ${call.action}`, value: this.duration(call.duration_ms) });
     }
     timeline.sort((left, right) => (left.start ?? 0) - (right.start ?? 0) || (left.sequence ?? 0) - (right.sequence ?? 0));
-    for (const step of timeline) {
-      values.push([[Number.isFinite(step.start) ? `+${this.duration(step.start)}` : '', step.title].filter(Boolean).join(' · '), step.value]);
-      if (step.reasoning) values.push([`Modell-Thinking · ${step.title}`, step.reasoning]);
-    }
     for (const [label, value] of values) this.appendHistoryField(disclosure, label, value);
-    if (values.length) article.append(disclosure);
+    for (const step of timeline) {
+      const label = [Number.isFinite(step.start) ? `+${this.duration(step.start)}` : '', step.title].filter(Boolean).join(' · ');
+      if (!step.round?.request && !step.round?.reasoning) {
+        this.appendHistoryField(disclosure, label, step.value);
+        continue;
+      }
+      const request = document.createElement('details');
+      const title = document.createElement('summary');
+      title.textContent = [label, step.value].filter(Boolean).join(' · ');
+      request.append(title);
+      if (step.round.request) {
+        const { method, endpoint, body } = step.round.request;
+        this.appendHistoryField(request, 'HTTP-Anfrage', [method, endpoint || 'kein gültiger Endpunkt'].join(' '));
+        this.appendHistoryField(request, typeof step.round.offered_tools === 'boolean' ? 'Vollständiger JSON-Body' : 'Multipart-Felder (Audio separat)', body);
+      }
+      if ('reasoning' in step.round) this.appendHistoryField(request, 'Modell-Thinking', step.round.reasoning || (step.round.failed ? 'Keine erfolgreiche API-Antwort.' : 'Der Anbieter hat kein Thinking geliefert.'));
+      disclosure.append(request);
+    }
+    if (values.length || timeline.length) article.append(disclosure);
   }
   appendHistoryField(container, label, value, error = false) {
     const field = document.createElement('p');

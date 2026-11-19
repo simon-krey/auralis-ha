@@ -177,13 +177,29 @@ class Bridge:
             self.entries.append(entry)
             await self.prune(persist=True)
 
-    def redact(self, message, url="", token=""):
+    def redact(self, message, url="", token="", *, limit=MAX_ERROR):
         url_secrets = [value for _, value in parse_qsl(urlsplit(url).query)]
         secrets = {token, self.settings["stt_token"], self.settings["llm_token"], *url_secrets}
         for secret in sorted(filter(None, secrets), key=len, reverse=True):
             message = message.replace(secret, "[redigiert]")
         message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [redigiert]", message)
-        return message[:MAX_ERROR]
+        return message[:limit]
+
+    def request_snapshot(self, kind, body):
+        url = self.settings[kind + "_url"]
+        endpoint = ""
+        if valid_url(url):
+            endpoint = llm_route(llm_base_url(url), "chat/completions") if kind == "llm" else url
+            endpoint = urlsplit(endpoint)._replace(query="").geturl()
+
+        def snapshot(value):
+            if isinstance(value, dict):
+                return {key: snapshot(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [snapshot(item) for item in value]
+            return self.redact(value, url=url if endpoint else "", limit=None) if isinstance(value, str) else value
+
+        return snapshot({"method": "POST", "endpoint": endpoint, "body": body})
 
     async def provider_json(self, method, url, token, *, payload=None, form=None):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -239,11 +255,13 @@ class Bridge:
         except Exception as error:
             raise AuralisError(diagnostic(error)) from None
 
-    async def timed_request(self, kind, details, origin, *, sequence=1, **kwargs):
+    async def timed_request(self, kind, details, origin, *, sequence=1, form_fields=None, **kwargs):
         started = time.perf_counter()
         request = {"started_ms": round((started - origin) * 1000), "sequence": sequence}
+        request["request"] = self.request_snapshot(kind, kwargs.get("payload", form_fields))
         if kind == "llm":
-            request["offered_tools"] = bool((kwargs.get("payload") or {}).get("tools"))
+            request["offered_tools"] = bool(kwargs["payload"].get("tools"))
+            request["reasoning"] = None
         details["requests"].append(request)
         try:
             data = await self.request(kind, **kwargs)
@@ -269,12 +287,15 @@ class Bridge:
             if not valid_audio:
                 raise AuralisError("Ungültige Audiodaten: leere Aufnahme, ungültiges Format oder mehr als 10 MiB.")
             form = aiohttp.FormData()
-            form.add_field("model", self.settings["stt_model"])
+            fields = {"model": self.settings["stt_model"]}
             if language:
-                form.add_field("language", language[:35].split("-")[0])
+                fields["language"] = language[:35].split("-")[0]
+            for key, value in fields.items():
+                form.add_field(key, value)
             extension = {"audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/mp4": "m4a"}.get(mime, mime.split("/")[1])
             form.add_field("file", audio, filename=f"audio.{extension}", content_type=mime)
-            data = await self.timed_request("stt", details, started, form=form)
+            fields["file"] = {"filename": f"audio.{extension}", "content_type": mime, "bytes": len(audio)}
+            data = await self.timed_request("stt", details, started, form=form, form_fields=fields)
             if not isinstance(data, dict) or not isinstance(data.get("text"), str):
                 raise AuralisError("In der STT-Antwort fehlt das Textfeld text.")
             transcript = data["text"][:MAX_TEXT]
@@ -292,10 +313,11 @@ class Bridge:
         details = {} if details is None else details
         details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[])
         results = []
+        history_input = self.redact(prompt[:MAX_TEXT], url=self.settings["llm_url"], limit=None) if isinstance(prompt, str) else ""
 
         async def finish(answer):
             details["duration_ms"] = elapsed_ms(started)
-            await self.record("llm", dry_run, input=prompt, answer=answer, tools=results, diagnostics=details)
+            await self.record("llm", dry_run, input=history_input, answer=answer, tools=results, diagnostics=details)
             return {"answer": answer, "tools": results, "diagnostics": details}
 
         try:
@@ -309,6 +331,14 @@ class Bridge:
             details["selection_ms"] = elapsed_ms(selection_started)
             details["selection_started_ms"] = round((selection_started - started) * 1000)
             details["selection"] = {"status": selection, "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets}
+            english = (language or "").lower().startswith("en")
+            if selection == "already_set":
+                target = inventory[0]
+                state = target["state"]
+                plural = target.get("count", 1) > 1
+                if english:
+                    return await finish(f"The lights are already {state}." if plural else f"The light is already {state}.")
+                return await finish(f"{'Die Lampen sind' if plural else 'Die Lampe ist'} schon {'an' if state == 'on' else 'aus'}.")
             allowed_ids = [entity["id"] for entity in inventory] if enabled else []
             prepared = None
             if len(enabled) == 1 and len(candidates) == 1:
@@ -316,7 +346,6 @@ class Bridge:
                 action = next(iter(enabled))
                 if action in {"turn_on", "turn_off"} and (bulk_targets or (candidate["id"].startswith("light.") and not candidate.get("group"))):
                     prepared = action
-            english = (language or "").lower().startswith("en")
             unconfirmed = "I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen."
             model_context = {"entities": inventory}
             if prepared:
@@ -341,8 +370,6 @@ class Bridge:
                 messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID."
             elif selection == "clarify":
                 messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
-            elif selection == "already_set":
-                messages[0]["content"] += "\nAlle passenden freigegebenen Geräte sind schon im gewünschten Zustand. Es wurde nichts geschaltet."
             elif not enabled:
                 messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
             if language:
@@ -360,7 +387,7 @@ class Bridge:
                 request["tool_calls"] = len(calls)
                 reasoning = provider_reasoning(msg)
                 if reasoning:
-                    request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"])
+                    request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"], limit=None)
                 if prepared:
                     if not calls:
                         details["confirmation"]["state"] = "missing"
@@ -412,5 +439,5 @@ class Bridge:
         except Exception as error:
             detail = self.redact(diagnostic(error))
             details["duration_ms"] = elapsed_ms(started)
-            await self.record("llm", dry_run, input=prompt[:MAX_TEXT] if isinstance(prompt, str) else "", tools=results, error=detail, diagnostics=details)
+            await self.record("llm", dry_run, input=history_input, tools=results, error=detail, diagnostics=details)
             raise AuralisError(detail) from None
