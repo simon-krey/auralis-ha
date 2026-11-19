@@ -11,6 +11,7 @@ import math
 import re
 
 _ENTITY = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+MAX_ACTION_TARGETS = 100
 
 # Parameters are deliberately service-specific: target, area and service names
 # never come from model-supplied arguments.
@@ -106,7 +107,7 @@ class ActionPolicy:
                 device = device_registry.async_get(self.hass).async_get(entry.device_id)
                 area_id = device.area_id if device else None
             area = area_registry.async_get(self.hass).async_get_area(area_id) if area_id else None
-            return area.name if area else None
+            return area
         except (ImportError, AttributeError, KeyError):
             return None
 
@@ -172,7 +173,7 @@ class ActionPolicy:
             return False
         return self.overrides.get(f"{state.entity_id}:activate") is True and (user is None or bool(getattr(user, "is_admin", False)))
 
-    def catalog(self, user=None):
+    def catalog(self, user=None, *, for_retrieval=False):
         result = []
         for state in self.hass.states.async_all():
             entity_id = state.entity_id
@@ -199,7 +200,12 @@ class ActionPolicy:
                 enabled = enabled and _permission(user, entity_id, "control") and self._scope_ok(state, user)
                 actions.append({"id": action, "label": label, "enabled": enabled, "configured": self._enabled(state, action)[0], "default_enabled": default, "sensitive": self._sensitive(state) or (domain == "scene" and not default), "parameters": {"type": "object", "properties": params, "required": list(params) if action != "light_set" else [], "additionalProperties": False}})
             if actions or domain in {"binary_sensor", "sensor"}:
-                result.append({"id": entity_id, "name": str(state.attributes.get("friendly_name", entity_id)), "area": self._area(entity_id), "state": str(state.state), "actions": actions})
+                area = self._area(entity_id)
+                entity = {"id": entity_id, "name": str(state.attributes.get("friendly_name", entity_id)), "area": area.name if area else None, "state": str(state.state), "actions": actions}
+                if for_retrieval:
+                    entry = self._registry_entry(entity_id)
+                    entity.update(aliases=[alias for alias in getattr(entry, "aliases", ()) if isinstance(alias, str)], area_aliases=getattr(area, "aliases", ()), area_id=area.id if area else None, group=self._group(state), device_class=state.attributes.get("device_class"))
+                result.append(entity)
         return result
 
     async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None):
@@ -213,7 +219,7 @@ class ActionPolicy:
         if not isinstance(action, str) or action not in _ACTIONS:
             error(None, "unknown action")
             return result
-        if not isinstance(entity_ids, list) or not entity_ids or len(entity_ids) > 100 or any(not isinstance(x, str) or not _ENTITY.fullmatch(x) for x in entity_ids):
+        if not isinstance(entity_ids, list) or not entity_ids or len(entity_ids) > MAX_ACTION_TARGETS or any(not isinstance(x, str) or not _ENTITY.fullmatch(x) for x in entity_ids):
             error(None, "invalid entity_ids")
             return result
         _, domains, service, schema = _ACTIONS[action]

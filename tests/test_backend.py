@@ -15,6 +15,7 @@ for name in ("aiohttp", "homeassistant", "homeassistant.helpers", "homeassistant
 sys.modules["homeassistant.helpers.aiohttp_client"].async_get_clientsession = lambda hass: None
 sys.modules["homeassistant.helpers.storage"].Store = object
 sys.modules["bridge_test.actions"].ActionPolicy = object
+sys.modules["bridge_test.actions"].MAX_ACTION_TARGETS = 100
 spec = importlib.util.spec_from_file_location("bridge_test.backend", ROOT / "backend.py")
 backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)
@@ -27,11 +28,28 @@ class Store:
     async def async_save(self, data): self.data = data
 
 class Policy:
-    def catalog(self, user=None):
-        return [{"id":"light.room", "name":"Room", "area":None, "state":"off", "actions":[{"id":"turn_on", "enabled":True}, {"id":"unlock", "enabled":False}]}]
+    def __init__(self):
+        self.entities = [{"id":"light.room", "name":"Room", "area":None, "state":"off", "actions":[{"id":"turn_on", "enabled":True}, {"id":"unlock", "enabled":False}]}]
+        self.calls = []
+
+    def catalog(self, user=None, *, for_retrieval=False):
+        return self.entities
+
     async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None):
         assert dry_run and user == "user" and context == "context"
-        return {"status":"dry_run"}
+        self.calls.append((action, entity_ids, parameters))
+        return {"executed": [], "planned": entity_ids, "skipped": [], "errors": []}
+
+
+def entity(entity_id, name, area, *actions, state="on", aliases=(), **extra):
+    return {"id": entity_id, "name": name, "area": area, "state": state, "aliases": aliases,
+            "actions": [{"id": action, "enabled": True} for action in actions], **extra}
+
+
+def tool_response(action, target):
+    import json
+    arguments = json.dumps({"action": action, "entity_ids": [target], "parameters": {}})
+    return {"choices": [{"message": {"tool_calls": [{"id": "1", "type": "function", "function": {"name": "run_action", "arguments": arguments}}]}}]}
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
     def bridge(self):
@@ -136,10 +154,76 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         obj.request = request
         result = await obj.chat("Licht an", "de", "context", "user", dry_run=True)
         self.assertEqual(result["answer"], "Erledigt")
-        self.assertEqual(result["tools"][0]["result"]["status"], "dry_run")
+        self.assertEqual(result["tools"][0]["result"]["planned"], ["light.room"])
         self.assertEqual(obj.entries[0]["tools"][0]["parameters"], {})
         self.assertTrue(obj.entries[0]["test"])
         self.assertNotIn("unlock", str(requests[0]))
         self.assertNotIn("secret", str(requests[0]))
+
+    async def test_alias_and_room_send_only_intended_target_and_action(self):
+        bridge = self.bridge()
+        policy = Policy()
+        policy.entities = [
+            entity("light.dining_left", "Orange", "Esszimmer", "turn_on", "turn_off", "light_set", aliases=["Tischlampe"], area_aliases={"Essbereich"}),
+            entity("light.office", "Orange", "Büro", "turn_on", "turn_off", "light_set", aliases=["Tischlampe"]),
+            entity("switch.dining", "Heizdecke", "Esszimmer", "turn_on", "turn_off"),
+        ]
+        bridge.policy = lambda: policy
+
+        async def request(_kind, *, payload):
+            content = payload["messages"][0]["content"]
+            self.assertIn("light.dining_left", content)
+            for irrelevant in ("light.office", "switch.dining", "light_set", "turn_on"):
+                self.assertNotIn(irrelevant, content)
+            properties = payload["tools"][0]["function"]["parameters"]["properties"]
+            self.assertEqual(properties["action"]["enum"], ["turn_off"])
+            self.assertEqual(properties["entity_ids"]["items"]["enum"], ["light.dining_left"])
+            return tool_response("turn_off", "light.office")
+
+        bridge.request = request
+        with self.assertRaisesRegex(backend.AuralisError, "nicht freigegebenen Werkzeugaufruf"):
+            await bridge.chat("Schalte die Tischlampe im Essbereich aus", "de", "context", "user", dry_run=True)
+        self.assertEqual(policy.calls, [])
+
+    async def test_bulk_batches_skip_off_disabled_and_unrelated_lights(self):
+        bridge = self.bridge()
+        policy = Policy()
+        targets = [f"light.living_{index}" for index in range(101)]
+        policy.entities = [entity(target, f"Leiste {index}", "Wohnzimmer", "turn_off", "light_set") for index, target in enumerate(targets)]
+        policy.entities += [entity("light.already_off", "Ausgeschaltet", "Wohnzimmer", "turn_off", state="off"),
+                            entity("light.disabled", "Deaktiviert", "Wohnzimmer", "turn_on"),
+                            entity("light.office", "Büroleuchte", "Büro", "turn_off"),
+                            entity("light.group", "Lichtgruppe", "Wohnzimmer", "turn_off", group=True)]
+        bridge.policy = lambda: policy
+        requests = []
+
+        async def request(_kind, *, payload):
+            requests.append(payload["messages"][-1]["content"])
+            self.assertNotIn("light.living_", payload["messages"][0]["content"])
+            if len(requests) == 1:
+                return tool_response("turn_off", backend.BULK_TARGET)
+            return {"choices": [{"message": {"content": "Die Lampen würden ausgeschaltet."}}]}
+
+        bridge.request = request
+        result = await bridge.chat("Alle Lichter im Wohnzimmer aus", "de", "context", "user", dry_run=True)
+        self.assertEqual([len(call[1]) for call in policy.calls], [100, 1])
+        self.assertEqual(result["tools"][0]["result"]["planned"], targets)
+        self.assertNotIn("light.living_", requests[1])
+        self.assertIn('"planned": 101', requests[1])
+
+    def test_retrieval_status_and_compound_light_commands(self):
+        catalog = [entity("light.first", "Ecke", "Wohnzimmer", "turn_on", "turn_off", "light_set"),
+                   entity("light.second", "Fenster", "Wohnzimmer", "turn_off", "light_set", state="off"),
+                   entity("light.third", "Ecke", "Küche", "turn_off"),
+                   entity("cover.garage", "Hof", "Wohnzimmer", "open", device_class="garage")]
+        for prompt in ("Licht aus", "Ecke aus", "Öffne die Rollos im Wohnzimmer", "Alle Lichter im Esszimer aus", "Schalte im Wohnzimmer alle Lampen außer Ecke aus", "Alle Lichter neben dem Sofa im Wohnzimmer aus", "Wohnzimmer aus", "Ecke an und aus", "Wie ist das Licht im Wohnzimmer?", "Erzähl mir einen Witz"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(backend.select_context(prompt, catalog)[1], {})
+        _, actions, targets, _ = backend.select_context("Mach die Wohnzimmerlampen blau und stell sie auf 40 Prozent", catalog)
+        self.assertEqual(list(actions), ["light_set"])
+        self.assertEqual(targets, ["light.first", "light.second"])
+        _, actions, targets, _ = backend.select_context("Alle Lichter aus", catalog)
+        self.assertEqual(list(actions), ["turn_off"])
+        self.assertEqual(targets, ["light.first", "light.third"])
 
 if __name__ == "__main__": unittest.main()

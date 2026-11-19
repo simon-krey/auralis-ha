@@ -11,8 +11,9 @@ from urllib.parse import parse_qsl, urlsplit
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
-from .actions import ActionPolicy
+from .actions import ActionPolicy, MAX_ACTION_TARGETS
 from .const import DEFAULTS, MAX_AUDIO, MAX_TEXT
+from .retrieval import BULK_TARGET, select_context
 
 MAX_HISTORY = 99 * 1024 * 1024
 MAX_AGE = 7 * 86400
@@ -233,19 +234,23 @@ class Bridge:
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_TEXT:
                 raise AuralisError("Eine Eingabe mit 1 bis 16.000 Zeichen ist erforderlich.")
             policy = self.policy()
-            catalog = policy.catalog(user=user)
-            inventory = []
-            enabled = {}
-            for entity in catalog:
-                actions = [a for a in entity.get("actions", []) if a.get("enabled") is True]
-                enabled.update((action["id"], action.get("parameters", {})) for action in actions)
-                inventory.append({key: entity.get(key) for key in ("id", "name", "area", "state")} | {"actions": [action["id"] for action in actions]})
+            candidates, enabled, bulk_targets, selection = select_context(prompt, policy.catalog(user=user, for_retrieval=True))
+            inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates]
+            allowed_ids = [entity["id"] for entity in inventory] if enabled else []
             inventory_text = json.dumps({"entities": inventory, "action_parameters": enabled}, ensure_ascii=False, separators=(",", ":"))
             if len(inventory_text) > 100000: raise AuralisError("Geräteliste zu groß für die LLM-Anfrage.")
             tools = []
             if enabled:
-                tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string"}, "maxItems":20}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
+                tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string", "enum":allowed_ids}, "minItems":1, "maxItems":1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
             messages = [{"role":"system", "content":self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text}, {"role":"user", "content":prompt}]
+            if bulk_targets:
+                messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID."
+            elif selection == "clarify":
+                messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
+            elif selection == "already_set":
+                messages[0]["content"] += "\nAlle passenden freigegebenen Geräte sind schon im gewünschten Zustand. Es wurde nichts geschaltet."
+            elif not enabled:
+                messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
             if language:
                 messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
             if dry_run:
@@ -261,7 +266,7 @@ class Bridge:
                     answer = clean(msg.get("content") or "")
                     await self.record("llm", dry_run, input=prompt, answer=answer, tools=results)
                     return {"answer": answer, "tools": results}
-                if round_index == 3 or len(calls) > 8: raise AuralisError("Zu viele Werkzeugaufrufe in der Anbieterantwort.")
+                if round_index == 3 or len(calls) > 8 or (bulk_targets and (results or len(calls) != 1)): raise AuralisError("Zu viele Werkzeugaufrufe in der Anbieterantwort.")
                 messages.append({"role":"assistant", "content":None, "tool_calls":calls})
                 for call in calls:
                     function = call["function"]
@@ -269,11 +274,19 @@ class Bridge:
                     action = args.get("action")
                     ids = args.get("entity_ids")
                     params = args.get("parameters")
-                    if function["name"] != "run_action" or action not in enabled or not isinstance(ids, list) or not 0 < len(ids) <= 20 or not all(isinstance(i, str) and len(i) <= 255 for i in ids) or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
+                    if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or len(ids) != 1 or ids[0] not in allowed_ids or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
                         raise AuralisError("Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf.")
-                    result = await policy.run(action, ids, params, context, dry_run=dry_run, user=user)
+                    if bulk_targets:
+                        ids = bulk_targets
+                        result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
+                        for offset in range(0, len(ids), MAX_ACTION_TARGETS):
+                            batch = await policy.run(action, ids[offset:offset + MAX_ACTION_TARGETS], params, context, dry_run=dry_run, user=user)
+                            for key in result:
+                                result[key].extend(batch[key])
+                    else:
+                        result = await policy.run(action, ids, params, context, dry_run=dry_run, user=user)
                     logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
-                    visible_result = result | {"errors": [{key: value for key, value in error.items() if key != "detail"} for error in result.get("errors", [])]}
+                    visible_result = {key: len(items) for key, items in result.items()} if bulk_targets else result | {"errors": [{key: value for key, value in error.items() if key != "detail"} for error in result.get("errors", [])]}
                     results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result})
                     messages.append({"role":"tool", "tool_call_id":call["id"], "content":json.dumps(visible_result, ensure_ascii=False)[:MAX_TEXT]})
             raise AuralisError("Zu viele Werkzeugrunden ohne finale LLM-Antwort.")

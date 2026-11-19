@@ -4,6 +4,8 @@
 
 Auralis verbindet die native Assist-Pipeline mit zwei getrennten OpenAI-kompatiblen APIs: eine für die Spracherkennung und eine für den Konversationsagenten. Der Agent steuert Geräte über einzeln freigebbare Aktionen. Die Sprachausgabe übernimmt Home Assistant, zum Beispiel mit Piper.
 
+Auralis grenzt Geräte und Aktionen vor jedem Modellaufruf lokal ein. Dafür nutzt es Namen, Home-Assistant-Aliasse, Räume und typische deutsche oder englische Befehlswörter. Bei unklaren Zielen erhält das Modell kein Werkzeug zum Schalten. „Alle Lichter im Wohnzimmer aus“ umfasst alle passenden, freigegebenen Lampen, die noch nicht aus sind. Dafür ist kein zweites Modell nötig.
+
 <!-- ha-marketplace:exclude-start -->
 ## Installation
 
@@ -33,6 +35,6 @@ Normale unterstützte Geräteaktionen sind standardmäßig aktiv. Sicherheitsrel
 
 ## Datenschutz und Verlauf
 
-STT sendet Audio an den eingestellten STT-Endpoint. Der LLM-Endpoint erhält den Prompt samt Gerätekontext und Tool-Ergebnissen. Nutze dafür Anbieter, denen du diese Daten anvertrauen möchtest. Tokens werden nach dem Speichern nicht erneut ans Panel gesendet; schütze trotzdem den Home-Assistant-Konfigurationsordner und deine Backups.
+STT sendet Audio an den eingestellten STT-Endpoint. Der LLM-Endpoint erhält die Anfrage, den dafür ausgewählten Gerätekontext und die Tool-Ergebnisse. Nutze dafür Anbieter, denen du diese Daten anvertrauen möchtest. Tokens werden nach dem Speichern nicht erneut ans Panel gesendet; schütze trotzdem den Home-Assistant-Konfigurationsordner und deine Backups.
 
 Der lokale Admin-Verlauf speichert Audio, Transkripte, finale Antworten, Tool-Aufrufe und Fehler bis zu sieben Tage und höchstens 100 MB. Der Tab **Verlauf** zeigt Test- und Live-Anfragen mit ihrer Kennzeichnung. Bei API-Fehlern stehen dort der HTTP-Status und, falls vorhanden, die Meldung des Anbieters. Bekannte Zugangsdaten werden in Fehlertexten redigiert. Du kannst die Aufzeichnung ausschalten und Einträge inklusive Audio löschen. Native STT- und LLM-Aufrufe stehen getrennt im Verlauf, weil Assist dem STT-Provider keine gemeinsame Aufruf-ID übergibt. Die native Spracherkennung ist für Deutsch und Englisch registriert. Echte API- und Geräteaufrufe müssen auf der Zielinstallation geprüft werden.
