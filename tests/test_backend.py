@@ -4,6 +4,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).parents[1] / "custom_components" / "auralis"
 package = types.ModuleType("bridge_test")
@@ -64,6 +65,65 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         obj.entries[0]["_timestamp"] = 0
         await obj.prune()
         self.assertEqual(obj.entries, [])
+
+    async def test_models_and_chat_use_base_url(self):
+        bridge = self.bridge()
+        await bridge.save({"llm_url": "https://example.test/v1/chat/completions/", "llm_model": "chat-a"})
+        requests = []
+
+        async def provider(method, url, token, **kwargs):
+            requests.append((method, url, token))
+            return {"data": [{"id": "chat-z"}, {"id": "chat-a"}, {"id": "chat-a"}, {}]}
+
+        bridge.provider_json = provider
+        self.assertEqual(bridge.public_settings()["llm_url"], "https://example.test/v1")
+        self.assertEqual(await bridge.list_models("https://example.test/v1/"), ["chat-a", "chat-z"])
+        await bridge.list_models("https://other.test/v1")
+        await bridge.list_models("https://example.test/v1", "")
+        await bridge.request("llm", payload={"model": "chat-a"})
+        self.assertEqual(requests, [
+            ("GET", "https://example.test/v1/models", "secret2"),
+            ("GET", "https://other.test/v1/models", ""),
+            ("GET", "https://example.test/v1/models", ""),
+            ("POST", "https://example.test/v1/chat/completions", "secret2"),
+        ])
+
+    async def test_provider_error_is_redacted_and_saved_for_tests(self):
+        bridge = self.bridge()
+        await bridge.save({"llm_url": "https://example.test/v1?api_key=private-query", "llm_model": "chat-a"})
+
+        async def chunks(_size):
+            yield b'{"error":{"code":"model_not_found","message":"Unknown model; token secret2 and private-query"}}'
+
+        class ProviderResponse:
+            status = 404
+            content = types.SimpleNamespace(iter_chunked=chunks)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+        session = types.SimpleNamespace(request=lambda *_args, **_kwargs: ProviderResponse())
+        with (
+            patch.object(backend, "async_get_clientsession", return_value=session),
+            patch.object(backend.aiohttp, "ClientTimeout", create=True),
+            patch.object(backend.aiohttp, "ClientError", type("ClientError", (Exception,), {}), create=True),
+        ):
+            with self.assertRaises(backend.AuralisError) as caught:
+                await bridge.chat("Licht an", "de", "context", "user", dry_run=True)
+        self.assertEqual(str(caught.exception), "HTTP 404: model_not_found · Unknown model; token [redigiert] and [redigiert]")
+        self.assertEqual(bridge.entries[0]["error"], str(caught.exception))
+        self.assertTrue(bridge.entries[0]["test"])
+
+    async def test_invalid_stt_test_is_logged(self):
+        bridge = self.bridge()
+        with self.assertRaisesRegex(backend.AuralisError, "Ungültige Audiodaten"):
+            await bridge.transcribe(b"", "audio/wav", "de", True)
+        self.assertEqual(bridge.entries[0]["kind"], "stt")
+        self.assertTrue(bridge.entries[0]["test"])
+        self.assertIn("Ungültige Audiodaten", bridge.entries[0]["error"])
 
     async def test_tool_loop_dry_run_and_disabled_action(self):
         obj = self.bridge()

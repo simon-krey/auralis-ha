@@ -36,7 +36,9 @@ class AuralisSTT(SpeechToTextEntity):
         audio = bytearray()
         async for chunk in stream:
             audio.extend(chunk)
-            if len(audio) > MAX_AUDIO - 44: return SpeechResult(None, SpeechResultState.ERROR)
+            if len(audio) > MAX_AUDIO - 44:
+                await self.bridge.record("stt", error="Die Aufnahme überschreitet 10 MiB.")
+                return SpeechResult(None, SpeechResultState.ERROR)
         try:
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wav:

@@ -259,6 +259,10 @@ class ActionPolicy:
                         actual_service = {"open": f"open_{domain}", "close": f"close_{domain}", "stop": f"stop_{domain}", "set_position": f"set_{domain}_position"}.get(action, service)
                         await self.hass.services.async_call(domain, actual_service, {"entity_id": leaf, **parameters}, blocking=True, context=context)
                         result["executed"].append(leaf)
-                    except Exception:
+                    except Exception as exception:
                         error(leaf, "service call failed")
+                        if isinstance(exception, ValueError) or type(exception).__module__.startswith("homeassistant."):
+                            result["errors"][-1]["detail"] = f"{type(exception).__name__}: {exception}"
+                        else:
+                            result["errors"][-1]["detail"] = type(exception).__name__
         return result

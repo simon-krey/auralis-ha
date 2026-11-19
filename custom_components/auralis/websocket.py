@@ -4,11 +4,12 @@ import binascii
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import Context
-from .const import DOMAIN, MAX_AUDIO
+from .backend import AuralisError
+from .const import DOMAIN, MAX_AUDIO, MAX_TEXT
 
 
 def register(hass):
-    for handler in (get, save, action, test_llm, test_stt, history, audio, clear):
+    for handler in (get, save, action, models, test_llm, test_stt, history, audio, clear):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -52,25 +53,40 @@ async def action(hass, connection, msg):
         return {}
     await execute(connection, msg, run)
 
+@command("models", {vol.Required("url"): vol.All(str, vol.Length(max=MAX_TEXT)), vol.Optional("token"): vol.All(str, vol.Length(max=MAX_TEXT))})
+async def models(hass, connection, msg):
+    async def run():
+        try:
+            return {"models": await hass.data[DOMAIN].list_models(msg["url"], msg.get("token"))}
+        except AuralisError as error:
+            return {"error": str(error)}
+    await execute(connection, msg, run)
+
 @command("test_llm", {vol.Required("prompt"): str, vol.Optional("language", default="de"): str})
 async def test_llm(hass, connection, msg):
     async def run():
         try:
             return await hass.data[DOMAIN].chat(msg["prompt"], msg["language"], Context(user_id=connection.user.id), connection.user, dry_run=True)
-        except ValueError:
-            return {"answer":"", "tools":[], "error":"Anfrage fehlgeschlagen"}
+        except AuralisError as error:
+            return {"answer": "", "tools": [], "error": str(error)}
     await execute(connection, msg, run)
 
 @command("test_stt", {vol.Required("audio"): str, vol.Required("mime"): str, vol.Optional("language", default="de"): str})
 async def test_stt(hass, connection, msg):
     async def run():
+        bridge = hass.data[DOMAIN]
         try:
-            if len(msg["audio"]) > ((MAX_AUDIO + 2) // 3) * 4: raise ValueError()
+            if len(msg["audio"]) > ((MAX_AUDIO + 2) // 3) * 4:
+                raise AuralisError("Die Testaufnahme überschreitet 10 MiB.")
             data = base64.b64decode(msg["audio"], validate=True)
-            transcript = await hass.data[DOMAIN].transcribe(data, msg["mime"], msg["language"], True)
-            return {"transcript":transcript}
-        except (ValueError, binascii.Error):
-            return {"transcript":"", "error":"Transkription fehlgeschlagen"}
+        except ValueError as error:
+            detail = str(error) if isinstance(error, AuralisError) else "Die Testaufnahme ist nicht gültig Base64-kodiert."
+            await bridge.record("stt", True, error=detail)
+            return {"transcript": "", "error": detail}
+        try:
+            return {"transcript": await bridge.transcribe(data, msg["mime"], msg["language"], True)}
+        except AuralisError as error:
+            return {"transcript": "", "error": str(error)}
     await execute(connection, msg, run)
 
 @command("history", {vol.Optional("limit", default=50): vol.All(int, vol.Range(min=1, max=100)), vol.Optional("offset", default=0): vol.All(int, vol.Range(min=0))})

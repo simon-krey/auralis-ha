@@ -20,14 +20,14 @@ Ohne Marketplace: Den Ordner `custom_components/auralis` aus dem Repository nach
 
 ## In Assist einrichten
 
-1. In der Sidebar **Auralis** öffnen. Für beide Anbieter die vollständige Endpoint-URL, das Modell und bei Bedarf einen API-Token eintragen. Typische Pfade sind `/v1/audio/transcriptions` und `/v1/chat/completions`. Das Chat-Modell muss strukturierte Tool-Aufrufe unterstützen.
+1. In der Sidebar **Auralis → Konfiguration** öffnen. Für STT die vollständige URL (z. B. `https://stt.example.com/v1/audio/transcriptions`), Modell und bei Bedarf Token eintragen. Beim LLM reicht die Basis-URL, z. B. `https://llm.example.com/v1`. Auralis lädt die Modell-IDs automatisch; die ID lässt sich auch manuell eingeben. Das Chat-Modell muss strukturierte Tool-Aufrufe unterstützen.
 2. Unter **Einstellungen → Sprachassistenten** einen Assistenten bearbeiten. **Auralis** für Spracherkennung und Konversation auswählen, **Piper** als Sprachausgabe einstellen. **Befehle bevorzugt lokal verarbeiten** für diese Pipeline ausschalten, damit die Aktionsfreigaben greifen. Piper bei Bedarf separat in Home Assistant einrichten.
 
 ## Testen und freigeben
 
 - **STT:** Im Panel das Mikrofon freigeben und einen kurzen Satz aufnehmen. Der Test zeigt das Transkript. Die Mikrofonaufnahme benötigt HTTPS oder einen anderen sicheren Browser-Kontext.
 - **LLM:** Einen Befehl wie „Mach die Wohnzimmerlampen blau und stell sie auf 40 Prozent“ eingeben. Der Trockenlauf zeigt die geplanten Aufrufe und prüft die Freigaben, ohne Home-Assistant-Dienste aufzurufen.
-- **Live:** Erst nach dem Trockenlauf in der nativen Assist-Pipeline sprechen. Den Toggle einer Lampe ausschalten und einen Raum- oder Gruppenbefehl wiederholen: Er sollte nur freigegebene Ziele ändern.
+- **Live:** Erst nach dem Trockenlauf in der nativen Assist-Pipeline sprechen. Unter **Erlaubte Aktionen** den Schalter einer Lampe ausschalten und einen Raum- oder Gruppenbefehl wiederholen: Er sollte nur freigegebene Ziele ändern.
 
 Normale unterstützte Geräteaktionen sind standardmäßig aktiv. Sicherheitsrelevante Aktionen und Szenen oder Skripte mit nicht zuverlässig prüfbaren Auswirkungen bleiben zunächst aus. Wer sie explizit aktiviert, erlaubt ihre Ausführung ohne weitere Rückfrage. Systemverwaltung und beliebige Dienstaufrufe sind nicht als Tools verfügbar. Die Integration unterstützt einen festen Katalog typischer Geräteaktionen, z. B. für Lichter, Schalter, Klima, Medienplayer, Rollläden und Saugroboter. Weitere Aktionen lassen sich über freigegebene Skripte abdecken. Undurchsichtige Szenen und Skripte sind auch nach Freigabe nur für Admin-Kontexte und Sprachsatelliten ohne Benutzer-ID verfügbar. Prüfe den Inhalt einer Szene oder eines Skripts vor der Freigabe; bestehende Automationen können unabhängig vom Agenten auf Zustandsänderungen reagieren.
 
@@ -35,4 +35,4 @@ Normale unterstützte Geräteaktionen sind standardmäßig aktiv. Sicherheitsrel
 
 STT sendet Audio an den eingestellten STT-Endpoint. Der LLM-Endpoint erhält den Prompt samt Gerätekontext und Tool-Ergebnissen. Nutze dafür Anbieter, denen du diese Daten anvertrauen möchtest. Tokens werden nach dem Speichern nicht erneut ans Panel gesendet; schütze trotzdem den Home-Assistant-Konfigurationsordner und deine Backups.
 
-Der lokale Admin-Verlauf speichert Audio, Transkripte, finale Antworten, Tool-Aufrufe und Fehler bis zu sieben Tage und höchstens 100 MB. Tests sind markiert. Du kannst die Aufzeichnung ausschalten und Einträge inklusive Audio löschen. Native STT- und LLM-Aufrufe stehen getrennt im Verlauf, weil Assist dem STT-Provider keine gemeinsame Aufruf-ID übergibt. Die native Spracherkennung ist für Deutsch und Englisch registriert. Echte API- und Geräteaufrufe müssen auf der Zielinstallation geprüft werden.
+Der lokale Admin-Verlauf speichert Audio, Transkripte, finale Antworten, Tool-Aufrufe und Fehler bis zu sieben Tage und höchstens 100 MB. Der Tab **Verlauf** zeigt Test- und Live-Anfragen mit ihrer Kennzeichnung. Bei API-Fehlern stehen dort der HTTP-Status und, falls vorhanden, die Meldung des Anbieters. Bekannte Zugangsdaten werden in Fehlertexten redigiert. Du kannst die Aufzeichnung ausschalten und Einträge inklusive Audio löschen. Native STT- und LLM-Aufrufe stehen getrennt im Verlauf, weil Assist dem STT-Provider keine gemeinsame Aufruf-ID übergibt. Die native Spracherkennung ist für Deutsch und Englisch registriert. Echte API- und Geräteaufrufe müssen auf der Zielinstallation geprüft werden.
