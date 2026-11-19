@@ -29,6 +29,8 @@ Ohne Marketplace: Den Ordner `custom_components/auralis` aus dem Repository nach
 
 Unter **Konfiguration → Reasoning (Thinking)** steuert **An** das Modell mit `reasoning_effort: "low"` und **Aus** mit `reasoning_effort: "none"`. **Anbieterstandard** sendet keinen Zusatzparameter und ist die Voreinstellung. Ob sich Thinking wirklich umschalten lässt, hängt vom Endpoint und Modell ab. Bei einer Ablehnung **Anbieterstandard** wählen. Thinking bleibt von der Sprachausgabe getrennt.
 
+Fehlt die Auswahl nach einem Update, prüfe, ob Version 1.3.0 oder neuer vollständig installiert ist, starte Home Assistant neu und lade die Home-Assistant-Seite im Browser vollständig neu. Falls nötig, den Browser-Cache für Home Assistant leeren.
+
 ## Testen und freigeben
 
 - **STT:** Im Panel das Mikrofon freigeben und einen kurzen Satz aufnehmen. Der Test zeigt das Transkript. Die Mikrofonaufnahme benötigt HTTPS oder einen anderen sicheren Browser-Kontext.
