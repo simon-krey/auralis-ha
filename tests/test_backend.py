@@ -91,6 +91,35 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await obj.prune()
         self.assertEqual(obj.entries, [])
 
+    async def test_reasoning_setting_applies_to_every_llm_round(self):
+        bridge = self.bridge()
+        policy = Policy()
+        policy.entities = [entity("switch.room", "Room", None, "turn_on", state="off")]
+        bridge.policy = lambda: policy
+        payloads = []
+
+        async def request(kind, *, payload):
+            self.assertEqual(kind, "llm")
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return tool_response("turn_on", "switch.room")
+            return {"choices": [{"message": {"content": "Erledigt"}}]}
+
+        bridge.request = request
+        self.assertEqual(bridge.public_settings()["llm_reasoning"], "default")
+        for mode, expected in (("default", None), ("on", "low"), ("off", "none"), ("default", None)):
+            with self.subTest(mode=mode):
+                await bridge.save({"llm_reasoning": mode})
+                self.assertEqual(bridge.store.data["settings"]["llm_reasoning"], mode)
+                payloads.clear()
+                await bridge.chat("Room an", "de", "context", "user", dry_run=True)
+                self.assertEqual(len(payloads), 2)
+                for payload in payloads:
+                    self.assertEqual(payload.get("reasoning_effort"), expected)
+                    self.assertEqual("reasoning_effort" in payload, expected is not None)
+        with self.assertRaises(ValueError):
+            await bridge.save({"llm_reasoning": "invalid"})
+
     async def test_models_and_chat_use_base_url(self):
         bridge = self.bridge()
         await bridge.save({"llm_url": "https://example.test/v1/chat/completions/", "llm_model": "chat-a"})

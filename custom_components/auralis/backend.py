@@ -12,7 +12,7 @@ import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from .actions import ActionPolicy, MAX_ACTION_TARGETS
-from .const import DEFAULTS, MAX_AUDIO, MAX_TEXT
+from .const import DEFAULTS, MAX_AUDIO, MAX_TEXT, REASONING_EFFORT
 from .retrieval import BULK_TARGET, select_context
 
 MAX_HISTORY = 99 * 1024 * 1024
@@ -139,6 +139,8 @@ class Bridge:
                 if not isinstance(value, bool): raise ValueError("Ungültige Einstellungen")
             elif not isinstance(value, str) or len(value) > MAX_TEXT:
                 raise ValueError("Ungültige Einstellungen")
+            if key == "llm_reasoning" and value not in REASONING_EFFORT:
+                raise ValueError("Ungültige Reasoning-Einstellung")
             if key.endswith("_url") and value and not valid_url(value):
                 raise ValueError("Ungültige Endpunkt-URL")
             new[key] = llm_base_url(value) if key == "llm_url" else value
@@ -376,8 +378,11 @@ class Bridge:
                 messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
             if dry_run and not prepared:
                 messages[0]["content"] += "\nTrockenlauf: Es wird nichts geschaltet. Beschreibe geplante Aktionen als Vorschau."
+            effort = REASONING_EFFORT[self.settings["llm_reasoning"]]
             for round_index in range(4):
                 payload = {"model": self.settings["llm_model"], "messages":messages}
+                if effort is not None:
+                    payload["reasoning_effort"] = effort
                 if tools and round_index < 3:
                     payload["tools"] = tools
                 data = await self.timed_request("llm", details, started, sequence=1 + round_index + len(results), payload=payload)

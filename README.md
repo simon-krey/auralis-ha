@@ -27,6 +27,8 @@ Ohne Marketplace: Den Ordner `custom_components/auralis` aus dem Repository nach
 1. In der Sidebar **Auralis → Konfiguration** öffnen. Für STT die vollständige URL (z. B. `https://stt.example.com/v1/audio/transcriptions`), Modell und bei Bedarf Token eintragen. Beim LLM reicht die Basis-URL, z. B. `https://llm.example.com/v1`. Auralis lädt die Modell-IDs automatisch; die ID lässt sich auch manuell eingeben. Das Chat-Modell muss strukturierte Tool-Aufrufe unterstützen.
 2. Unter **Einstellungen → Sprachassistenten** einen Assistenten bearbeiten. **Auralis** für Spracherkennung und Konversation auswählen, **Piper** als Sprachausgabe einstellen. **Befehle bevorzugt lokal verarbeiten** für diese Pipeline ausschalten, damit die Aktionsfreigaben greifen. Piper bei Bedarf separat in Home Assistant einrichten.
 
+Unter **Konfiguration → Reasoning (Thinking)** steuert **An** das Modell mit `reasoning_effort: "low"` und **Aus** mit `reasoning_effort: "none"`. **Anbieterstandard** sendet keinen Zusatzparameter und ist die Voreinstellung. Ob sich Thinking wirklich umschalten lässt, hängt vom Endpoint und Modell ab. Bei einer Ablehnung **Anbieterstandard** wählen. Thinking bleibt von der Sprachausgabe getrennt.
+
 ## Testen und freigeben
 
 - **STT:** Im Panel das Mikrofon freigeben und einen kurzen Satz aufnehmen. Der Test zeigt das Transkript. Die Mikrofonaufnahme benötigt HTTPS oder einen anderen sicheren Browser-Kontext.
