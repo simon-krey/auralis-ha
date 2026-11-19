@@ -322,6 +322,124 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             await bridge.chat("turn on One", "en", "context", "user", dry_run=True)
         self.assertEqual(policy.calls, [])
 
+    async def test_context_budget_settings_and_compact_profiles(self):
+        bridge = self.bridge()
+        for value in (True, 100000, "8000"):
+            with self.assertRaises(ValueError):
+                await bridge.save({"llm_context_budget": value})
+        await bridge.save({"llm_context_budget": 16000})
+        policy = Policy()
+        schema = {"type": "object", "properties": {"brightness": {"type": "integer", "minimum": 0, "maximum": 255}}}
+        policy.entities = [entity(f"light.l{i}", f"Lamp {i}", "Room", "light_set") for i in range(100)]
+        for item in policy.entities:
+            item["actions"][0]["parameters"] = schema
+        policy.entities.append(entity("sensor.disabled", "Disabled", None))
+        bridge.policy = lambda: policy
+        bridge.settings["llm_full_context"] = True
+        async def request(_kind, *, payload):
+            import json
+            text = payload["messages"][0]["content"]
+            self.assertEqual(text.count('"brightness"'), 1)
+            self.assertNotIn("sensor.disabled", text)
+            self.assertEqual(payload["max_tokens"], 768)
+            self.assertLess(len(text), len(json.dumps(policy.entities, ensure_ascii=False)) * 0.65)
+            return {"choices": [{"message": {"content": "OK"}}]}
+        bridge.request = request
+        result = await bridge.chat("What devices are available?", "en", "context", "user", dry_run=True)
+        self.assertFalse(result["diagnostics"]["context_budget"]["fallback"])
+
+    async def test_full_overflow_falls_back_without_full_authority(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity(f"fan.device_{i}", "Device " + str(i) + "x" * 50, "Room", "turn_on") for i in range(500)]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            self.assertNotIn("tools", payload)
+            self.assertNotIn("fan.device_499", payload["messages"][0]["content"])
+            return tool_response("turn_on", "fan.device_499")
+        bridge.request = request
+        details = {}
+        with self.assertRaises(backend.AuralisError):
+            await bridge.chat("Start the breeze device", "en", "context", "user", dry_run=True, details=details)
+        self.assertTrue(details["context_budget"]["fallback"])
+        self.assertFalse(policy.calls)
+
+    async def test_full_profiles_keep_fan_and_light_parameters_and_pairing(self):
+        import json
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        light = entity("light.desk", "Desk", "Office", "light_set")
+        fan = entity("fan.desk", "Fan", "Office", "fan_set")
+        light["actions"][0]["parameters"] = {"properties": {"brightness": {"type": "integer"}}}
+        fan["actions"][0]["parameters"] = {"properties": {"percentage": {"type": "integer"}}}
+        policy.entities = [light, fan]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            content = payload["messages"][0]["content"]
+            catalog = json.loads(content.split("Geräte: ", 1)[1].split("\n", 1)[0])
+            rows = {row[0]: row for row in catalog["entities"]}
+            for entity_id, action, parameter in (("light.desk", "light_set", "brightness"), ("fan.desk", "fan_set", "percentage")):
+                profile = catalog["profiles"][rows[entity_id][4]]
+                self.assertIn(parameter, catalog["schemas"][profile[action]]["properties"])
+            return tool_response("light_set", "fan.desk")
+        bridge.request = request
+        with self.assertRaises(backend.AuralisError):
+            await bridge.chat("Adjust the device", "en", "context", "user", dry_run=True)
+        self.assertFalse(policy.calls)
+
+    async def test_full_overflow_preserves_fixed_bulk_targets(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        targets = [entity(f"light.l{i}", "Lamp " + str(i), None, "turn_off") for i in range(3)]
+        policy.entities = targets + [entity(f"fan.f{i}", "Fan " + str(i) + "x" * 60, None, "turn_on") for i in range(500)]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            self.assertEqual(payload["tools"][0]["function"]["name"], "confirm_action")
+            return confirmation_response(approved=True)
+        bridge.request = request
+        result = await bridge.chat("Turn off all lights", "en", "context", "user", dry_run=True)
+        self.assertTrue(result["diagnostics"]["context_budget"]["fallback"])
+        self.assertEqual(policy.calls[0][1], [item["id"] for item in targets])
+
+    async def test_output_limit_does_not_execute_tool_calls(self):
+        bridge = self.bridge()
+        policy = Policy()
+        policy.entities = [entity("switch.room", "Room", None, "turn_on", state="off")]
+        bridge.policy = lambda: policy
+
+        async def request(_kind, *, payload):
+            response = tool_response("turn_on", "switch.room")
+            response["choices"][0]["finish_reason"] = "length"
+            return response
+
+        bridge.request = request
+        with self.assertRaisesRegex(backend.AuralisError, "Ausgabelimit"):
+            await bridge.chat("Room an", "de", "context", "user", dry_run=True)
+        self.assertEqual(policy.calls, [])
+
+    async def test_followup_budget_blocks_second_request(self):
+        bridge = self.bridge()
+        policy = Policy()
+        policy.entities = [entity("switch.room", "Room", None, "turn_on")]
+        bridge.policy = lambda: policy
+        calls = 0
+        async def request(_kind, *, payload):
+            nonlocal calls
+            calls += 1
+            response = tool_response("turn_on", "switch.room")
+            response["choices"][0]["message"]["tool_calls"][0]["extra"] = "x" * 16000
+            return response
+        bridge.request = request
+        details = {}
+        with self.assertRaisesRegex(backend.AuralisError, "Kontextbudget"):
+            await bridge.chat("Room on", "en", "context", "user", dry_run=True, details=details)
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(policy.calls), 1)
+        self.assertEqual(len(details["context_budget"]["rounds"]), 2)
+
     async def test_full_catalog_is_present_without_granting_tools(self):
         bridge = self.bridge()
         bridge.settings["llm_full_context"] = True

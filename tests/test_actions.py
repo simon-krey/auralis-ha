@@ -63,6 +63,27 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["executed"], ["light.one"])
         self.assertEqual(len(self.hass.services.calls), 1)
 
+    def test_defaults_keep_common_controls_and_exclude_helpers(self):
+        self.hass.states.items.update({item.entity_id: item for item in (
+            state("switch.plug", friendly_name="Steckdose"),
+            state("switch.phone_dnd_mode"),
+            state("switch.phone", friendly_name="Phone Do Not Disturb"),
+            state("switch.mobile", friendly_name="PhoneDnDMode"),
+            state("switch.blend", friendly_name="Sandstone"),
+            state("switch.config"),
+            state("input_boolean.helper"),
+        )})
+        registry = self.policy._registry_entry
+        self.policy._registry_entry = lambda eid: SimpleNamespace(platform="mqtt", entity_category="config") if eid == "switch.config" else registry(eid)
+        defaults = {item["id"]: next(action["enabled"] for action in item["actions"] if action["id"] == "turn_on")
+                    for item in self.policy.catalog() if item["id"].startswith(("switch.", "input_boolean."))}
+        self.assertEqual({target for target, enabled in defaults.items() if enabled}, {"switch.plug", "switch.blend"})
+        self.overrides["switch.phone:turn_on"] = True
+        self.overrides["switch.plug:turn_on"] = False
+        self.assertEqual(self.run_action("turn_on", ["switch.phone", "switch.plug"], dry_run=True)["planned"], ["switch.phone"])
+        self.overrides.clear()
+        self.assertEqual(self.run_action("turn_on", ["switch.phone", "switch.plug"], dry_run=True)["planned"], ["switch.plug"])
+
     def test_sensitive_and_live_override(self):
         self.assertEqual(self.run_action("unlock", ["lock.front"])["executed"], [])
         self.overrides["lock.front:unlock"] = True

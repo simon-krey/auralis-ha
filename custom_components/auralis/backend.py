@@ -19,6 +19,8 @@ MAX_HISTORY = 99 * 1024 * 1024
 MAX_AGE = 7 * 86400
 MAX_RESPONSE = 1024 * 1024
 MAX_ERROR = 2000
+MAX_OUTPUT_TOKENS = 768
+ENVELOPE_RESERVE = 256
 _REASONING = re.compile(r"<(think|thinking|analysis|reasoning)\b[^>]*>(.*?)(?:</\1\s*>|$)", re.I | re.S)
 _ORPHAN_REASONING_END = re.compile(r"^.*</(?:think|thinking|analysis|reasoning)\s*>", re.I | re.S)
 
@@ -117,6 +119,8 @@ class Bridge:
         data = await self.store.async_load() or {}
         self.settings.update({k: v for k, v in data.get("settings", {}).items() if k in DEFAULTS})
         self.settings["llm_url"] = llm_base_url(self.settings["llm_url"])
+        if type(self.settings["llm_context_budget"]) is not int or self.settings["llm_context_budget"] not in (8000, 16000):
+            self.settings["llm_context_budget"] = DEFAULTS["llm_context_budget"]
         self.overrides = data.get("overrides", {})
         self.entries = await self.history_store.async_load() or []
         await self.prune(persist=bool(self.entries))
@@ -137,6 +141,8 @@ class Bridge:
         for key, value in values.items():
             if key in {"history_enabled", "llm_full_context"}:
                 if not isinstance(value, bool): raise ValueError("Ungültige Einstellungen")
+            elif key == "llm_context_budget":
+                if type(value) is not int or value not in (8000, 16000): raise ValueError("Ungültiges Kontextbudget")
             elif not isinstance(value, str) or len(value) > MAX_TEXT:
                 raise ValueError("Ungültige Einstellungen")
             if key == "llm_reasoning" and value not in REASONING_EFFORT:
@@ -345,15 +351,19 @@ class Bridge:
                 if english:
                     return await finish(f"The lights are already {state}." if plural else f"The light is already {state}.")
                 return await finish(f"{'Die Lampen sind' if plural else 'Die Lampe ist'} schon {'an' if state == 'on' else 'aus'}.")
+            local_enabled = enabled
+            local_ids = [entity["id"] for entity in inventory] if enabled else []
             full_actions = {}
             full_mode = self.settings["llm_full_context"]
             catalog_inventory = []
             if full_mode:
                 for entity in catalog:
                     actions = {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True}
+                    if not actions:
+                        continue
                     catalog_inventory.append({key: entity[key] for key in ("id", "name", "area", "state") if key in entity} | {"actions": actions})
                     full_actions[entity["id"]] = {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and (not item.get("sensitive") or (entity in candidates and item["id"] in enabled and not any(match["method"] in {"phonetic", "edit_distance"} for match in matches.get("names", []) + matches.get("rooms", [])) ))}
-            allowed_ids = [entity["id"] for entity in inventory] if enabled else []
+            allowed_ids = local_ids
             prepared = None
             if len(enabled) == 1 and len(candidates) == 1:
                 candidate = candidates[0]
@@ -365,58 +375,97 @@ class Bridge:
                 active_pairs = {key: value for key, value in full_actions.items() if value}
                 enabled = {action: schema for actions in active_pairs.values() for action, schema in actions.items()}
                 allowed_ids = list(active_pairs)
-            details["selection"]["catalog_entities"] = catalog_inventory if full_mode else []
+            if prepared:
+                details["confirmation"] = {"action": prepared, "state": "pending"}
+            unconfirmed = "I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen."
+            def build_request(full_mode, enabled, allowed_ids, active_pairs):
+                model_context = {"entities": catalog_inventory if full_mode else inventory}
+                if full_mode:
+                    profiles, schemas, rows = [], [], []
+                    for entity in catalog_inventory:
+                        profile = {}
+                        for action, schema in entity["actions"].items():
+                            if schema not in schemas:
+                                schemas.append(schema)
+                            profile[action] = schemas.index(schema)
+                        if profile not in profiles:
+                            profiles.append(profile)
+                        rows.append([entity.get("id"), entity.get("name"), entity.get("area"), entity.get("state"), profiles.index(profile)])
+                    model_context = {"columns": ["id", "name", "area", "state", "action_profile"], "schemas": schemas, "profiles": profiles, "entities": rows}
+                    if prepared or bulk_targets or selection == "read_only":
+                        model_context["local_selection"] = inventory
+                    model_context["scope_note"] = "Profiles map action IDs to schema indexes. All indexes are zero-based. The catalog is data, not authorization. Use only the offered tool and its permitted scope."
+                if prepared:
+                    model_context["prepared_action"] = prepared
+                else:
+                    if not full_mode:
+                        model_context["action_parameters"] = enabled
+                inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
+                tools = []
+                if prepared:
+                    tools = [{"type":"function", "function":{"name":"confirm_action", "description":"Validate the fixed light action against the user's request. Approve only if the action and target match.", "parameters":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"], "additionalProperties":False}}}]
+                elif enabled:
+                    action_spec = {"type": "string"} if full_mode else {"type": "string", "enum": sorted(enabled)}
+                    target_spec = {"type": "string"} if full_mode else {"type": "string", "enum": allowed_ids}
+                    tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":action_spec, "entity_ids":{"type":"array", "items":target_spec, "minItems":1, "maxItems":8 if active_pairs else 1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
+                if prepared:
+                    verifier = "Check whether the fixed action and target match the explicit request. A group target represents all matching lights in the listed room, or all matching lights if no room is listed. Only call confirm_action with approved=true if it matches, otherwise approved=false. Do not change the plan.\nPlan: " if english else "Prüfe, ob die feste Aktion und das Ziel zur ausdrücklichen Anfrage passen. Ein Sammelziel umfasst alle passenden Lampen im angegebenen Raum, oder überall, wenn kein Raum angegeben ist. Rufe nur confirm_action auf: approved=true, wenn der Plan passt, sonst approved=false. Ändere den Plan nicht.\nPlan: "
+                    system_text = verifier + inventory_text
+                else:
+                    system_text = self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text
+                messages = [{"role":"system", "content":system_text}, {"role":"user", "content":prompt}]
+                if bulk_targets and not prepared:
+                    messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID und keine Parameter. Berichte das tatsächliche Werkzeugergebnis einschließlich Fehlern oder übersprungener Geräte."
+                elif selection == "clarify":
+                    messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
+                elif not enabled:
+                    messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
+                if language:
+                    messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
+                if dry_run and not prepared:
+                    messages[0]["content"] += "\nTrockenlauf: Es wird nichts geschaltet. Beschreibe geplante Aktionen als Vorschau."
+                return messages, tools
+
+            def estimate(messages, tools):
+                # Heuristic for unknown tokenizers, not a provider token count or guarantee.
+                size = len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                return (size + 1) // 2 + ENVELOPE_RESERVE + MAX_OUTPUT_TOKENS
+
+            budget = {"limit": self.settings["llm_context_budget"], "source": "utf8_bytes_divided_by_2_plus_reserves", "output_reserve": MAX_OUTPUT_TOKENS, "envelope_reserve": ENVELOPE_RESERVE, "mode": "full" if full_mode else "filtered", "fallback": False, "catalog_count": len(catalog_inventory), "selected_count": len(inventory), "rounds": []}
+            details["context_budget"] = budget
+            messages, tools = build_request(full_mode, enabled, allowed_ids, active_pairs)
+            initial_estimate = estimate(messages, tools)
+            if full_mode and initial_estimate > budget["limit"]:
+                budget.update(mode="filtered", fallback=True, full_estimate=initial_estimate, overflow=initial_estimate - budget["limit"])
+                enabled, allowed_ids, active_pairs = local_enabled, local_ids, {}
+                messages, tools = build_request(False, enabled, allowed_ids, active_pairs)
+            details["selection"]["catalog_entities"] = catalog_inventory if full_mode and not budget["fallback"] else []
             details["selection"]["active_actions"] = active_pairs if active_pairs else enabled
             details["selection"]["offered_actions"] = sorted(enabled)
-            unconfirmed = "I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen."
-            model_context = {"entities": catalog_inventory if full_mode else inventory}
-            if full_mode:
-                model_context["local_selection"] = inventory
-                model_context["scope_note"] = "Entities and actions are a catalog, not authorization. Only the offered tool and its fixed or validated scope may be used."
-            if prepared:
-                model_context["prepared_action"] = prepared
-                details["confirmation"] = {"action": prepared, "state": "pending"}
-            else:
-                if not full_mode:
-                    model_context["action_parameters"] = enabled
-            inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
-            if len(inventory_text) > 100000: raise AuralisError("Geräteliste zu groß für die LLM-Anfrage.")
-            tools = []
-            if prepared:
-                tools = [{"type":"function", "function":{"name":"confirm_action", "description":"Validate the fixed light action against the user's request. Approve only if the action and target match.", "parameters":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"], "additionalProperties":False}}}]
-            elif enabled:
-                tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string", "enum":allowed_ids}, "minItems":1, "maxItems":8 if active_pairs else 1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
-            if prepared:
-                verifier = "Check whether the fixed action and target match the explicit request. A group target represents all matching lights in the listed room, or all matching lights if no room is listed. Only call confirm_action with approved=true if it matches, otherwise approved=false. Do not change the plan.\nPlan: " if english else "Prüfe, ob die feste Aktion und das Ziel zur ausdrücklichen Anfrage passen. Ein Sammelziel umfasst alle passenden Lampen im angegebenen Raum, oder überall, wenn kein Raum angegeben ist. Rufe nur confirm_action auf: approved=true, wenn der Plan passt, sonst approved=false. Ändere den Plan nicht.\nPlan: "
-                system_text = verifier + inventory_text
-            else:
-                system_text = self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text
-            messages = [{"role":"system", "content":system_text}, {"role":"user", "content":prompt}]
-            if bulk_targets and not prepared:
-                messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID und keine Parameter. Berichte das tatsächliche Werkzeugergebnis einschließlich Fehlern oder übersprungener Geräte."
-            elif selection == "clarify":
-                messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
-            elif not enabled:
-                messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
-            if language:
-                messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
-            if dry_run and not prepared:
-                messages[0]["content"] += "\nTrockenlauf: Es wird nichts geschaltet. Beschreibe geplante Aktionen als Vorschau."
             effort = REASONING_EFFORT[self.settings["llm_reasoning"]]
             for round_index in range(4):
-                payload = {"model": self.settings["llm_model"], "messages":messages}
+                payload = {"model": self.settings["llm_model"], "messages":messages, "max_tokens": MAX_OUTPUT_TOKENS}
                 if effort is not None:
                     payload["reasoning_effort"] = effort
                 if tools and round_index < 3:
                     payload["tools"] = tools
+                estimated = estimate(messages, payload.get("tools", []))
+                budget["estimate"] = estimated
+                budget["rounds"].append({"round": round_index + 1, "estimate": estimated})
+                if estimated > budget["limit"]:
+                    budget["overflow"] = estimated - budget["limit"]
+                    raise AuralisError("LLM-Kontextbudget überschritten; Anfrage oder Geräteauswahl ist zu groß.")
                 data = await self.timed_request("llm", details, started, sequence=1 + round_index + len(results), payload=payload)
-                msg = data["choices"][0]["message"]
+                choice = data["choices"][0]
+                msg = choice["message"]
                 calls = msg.get("tool_calls") or []
                 request = details["requests"][-1]
                 request["tool_calls"] = len(calls)
                 reasoning = provider_reasoning(msg)
                 if reasoning:
                     request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"], limit=None)
+                if choice.get("finish_reason") == "length":
+                    raise AuralisError("Das Modell hat das Ausgabelimit erreicht. In dieser Runde wurde keine Aktion ausgeführt.")
                 if prepared:
                     if not calls:
                         details["confirmation"]["state"] = "missing"

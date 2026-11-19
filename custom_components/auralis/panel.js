@@ -65,6 +65,7 @@ class AuralisPanel extends HTMLElement {
     this.$('#llm_reasoning').value = s.llm_reasoning || 'default';
     this.$('#history_enabled').checked = !!s.history_enabled;
     this.$('#llm_full_context').checked = !!s.llm_full_context;
+    this.$('#llm_context_budget').value = String(s.llm_context_budget ?? 8000);
     for (const service of ['stt', 'llm']) {
       this.$(`#${service}_token`).value = '';
       this.$(`#${service}_token_mode`).value = 'keep';
@@ -139,6 +140,7 @@ class AuralisPanel extends HTMLElement {
     settings.llm_reasoning = this.$('#llm_reasoning').value;
     settings.history_enabled = this.$('#history_enabled').checked;
     settings.llm_full_context = this.$('#llm_full_context').checked;
+    settings.llm_context_budget = Number(this.$('#llm_context_budget').value);
     for (const service of ['stt', 'llm']) {
       const mode = this.$(`#${service}_token_mode`).value;
       if (mode === 'replace') settings[`${service}_token`] = this.$(`#${service}_token`).value;
@@ -183,7 +185,7 @@ class AuralisPanel extends HTMLElement {
         check.setAttribute('aria-label', `${action.label || action.id} für ${entity.name || entity.id} freigeben`);
         check.addEventListener('change', async () => {
           const previous = !check.checked; check.disabled = true;
-          try { await this.call('action', { entity_id: entity.id, action: action.id, enabled: check.checked }); action.enabled = check.checked; this.status('Aktionsfreigabe gespeichert.'); }
+          try { await this.call('action', { entity_id: entity.id, action: action.id, enabled: check.checked }); action.configured = check.checked; this.status('Aktionsfreigabe gespeichert.'); }
           catch (error) { check.checked = previous; this.status(`Aktionsfreigabe fehlgeschlagen: ${this.error(error)}`, true); }
           finally { check.disabled = false; }
         });
@@ -192,6 +194,22 @@ class AuralisPanel extends HTMLElement {
       list.append(group);
     }
     if (!count) { const empty = document.createElement('p'); empty.className = 'meta'; empty.textContent = 'Keine passenden Aktionen gefunden.'; list.append(empty); }
+  }
+  async resetActions() {
+    if (!window.confirm('Alle manuellen Aktionsfreigaben und Sperren entfernen und die Standardfreigaben wiederherstellen?')) return;
+    const button = this.$('#reset_actions');
+    button.disabled = true;
+    this.$('#actions').inert = true;
+    try {
+      const data = await this.call('reset_actions');
+      this._entities = data.entities;
+      this.renderActions();
+      this.status('Standardfreigaben wiederhergestellt.');
+    } catch (error) { this.status(`Zurücksetzen fehlgeschlagen: ${this.error(error)}`, true); }
+    finally {
+      this.$('#actions').inert = false;
+      button.disabled = false;
+    }
   }
   async testLLM(event) {
     event.preventDefault();
@@ -231,6 +249,7 @@ class AuralisPanel extends HTMLElement {
     const lines = [];
     if (Number.isFinite(details.duration_ms)) lines.push(`Verarbeitungszeit: ${this.duration(details.duration_ms)}`);
     if (details.selection) lines.push(`An das LLM übergebene Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
+    if (details.context_budget?.fallback) lines.push('Vollkatalog zu groß: lokale Auswahl verwendet.');
     lines.push(this.confirmationText(details.confirmation));
     return lines.filter(Boolean).map(line => `\n${line}`).join('');
   }
@@ -256,6 +275,12 @@ class AuralisPanel extends HTMLElement {
     const disclosure = document.createElement('details');
     const title = document.createElement('summary'); title.textContent = 'Verarbeitungsdetails'; disclosure.append(title);
     const values = [];
+    if (details.context_budget) {
+      const budget = details.context_budget;
+      const tokens = value => Number.isFinite(value) ? value.toLocaleString('de-DE') : '–';
+      values.push(['Kontextbudget (Schätzung inkl. Ausgabe)', `${tokens(budget.estimate)} von ${tokens(budget.limit)} Tokens`]);
+      if (budget.fallback) values.push(['Lokaler Fallback', `Vollkatalog: ${tokens(budget.full_estimate)} geschätzte Tokens für ${tokens(budget.catalog_count)} Geräte`]);
+    }
     const timeline = [];
     if (Number.isFinite(details.selection_ms)) timeline.push({ start: details.selection_started_ms, sequence: 0, title: 'Lokale Auswahl', value: this.duration(details.selection_ms) });
     if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
@@ -451,7 +476,9 @@ class AuralisPanel extends HTMLElement {
         <div class="grid">
       <section class="card"><div class="card-head"><p class="eyebrow">01 / Verbindung</p><h2>Dienste & Einstellungen</h2><p class="muted">Änderungen gelten nach dem Speichern.</p></div><p id="destinations" class="notice"></p><form id="settings"><h3 class="subheading">Spracheingabe · STT</h3><div class="fields"><label class="field">STT-URL<input id="stt_url" type="url" autocomplete="off"></label><label class="field">Modell<input id="stt_model" autocomplete="off"></label><label class="field">Token <span id="stt_token_state" class="meta"></span><select id="stt_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues STT-Token<input id="stt_token" type="password" autocomplete="new-password" disabled></label></div><h3 class="subheading">Verarbeitung · LLM</h3><div class="fields"><label class="field">LLM-Basis-URL<input id="llm_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label><label class="field">Modell<input id="llm_model" list="llm_models" aria-describedby="model_status" autocomplete="off"><datalist id="llm_models"></datalist></label><label class="field">Token <span id="llm_token_state" class="meta"></span><select id="llm_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues LLM-Token<input id="llm_token" type="password" autocomplete="new-password" disabled></label><div class="wide model-controls"><button id="load_models" type="button">Modelle laden</button><p id="model_status" class="meta" role="status"></p></div>
       <label class="field wide">Reasoning (Thinking)<select id="llm_reasoning" aria-describedby="llm_reasoning_help"><option value="default">Anbieterstandard</option><option value="on">An</option><option value="off">Aus</option></select><small id="llm_reasoning_help">An und Aus setzen Unterstützung für reasoning_effort voraus. Bei Fehlern Anbieterstandard wählen.</small></label>
-      <label class="checkrow wide"><input id="llm_full_context" type="checkbox" aria-describedby="llm_full_context_help"> Alle Geräte an das LLM senden</label><p id="llm_full_context_help" class="meta wide">Sendet Geräteinformationen an den eingestellten LLM-Endpoint und kann mehr Kontext verbrauchen.</p><label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>
+      <label class="checkrow wide"><input id="llm_full_context" type="checkbox" aria-describedby="llm_full_context_help"> Alle Geräte an das LLM senden</label><p id="llm_full_context_help" class="meta wide">Sendet freigegebene Geräte und Aktionen an den eingestellten LLM-Endpunkt.</p>
+      <label class="field wide">LLM-Kontextbudget<select id="llm_context_budget" aria-describedby="llm_context_budget_help"><option value="8000">8.000 Tokens (empfohlen)</option><option value="16000">16.000 Tokens</option></select><small id="llm_context_budget_help">Schätzwert inklusive Antwort. Passt der Vollkatalog nicht hinein, greift die lokale Auswahl.</small></label>
+      <label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>
       <section class="card"><div class="card-head"><p class="eyebrow">03 / Test</p><h2>Sprachtest</h2><p class="muted">Eine Aufnahme an das gespeicherte STT-Ziel senden. Maximal 30 Sekunden.</p></div><label class="field">Sprache<input id="stt_language" value="de" autocomplete="off"></label><p class="meta">Mikrofonzugriff benötigt HTTPS oder localhost und deine Erlaubnis.</p><button id="record" type="button">Aufnahme starten</button><p id="stt_result" class="result" role="status" aria-live="polite"></p><hr class="divider"><h3>LLM-Probelauf</h3><p class="meta">Testet die Verarbeitung mit den gespeicherten Einstellungen.</p><form id="llm_form"><label class="field">Sprache<input id="llm_language" value="de" autocomplete="off"></label><label class="field">Testnachricht<textarea id="test_prompt" required></textarea></label><p><button id="llm_test" type="submit">LLM testen</button></p></form><p id="llm_result" class="result" role="status" aria-live="polite"></p></section>
         </div>
       </div>
@@ -459,7 +486,7 @@ class AuralisPanel extends HTMLElement {
       <section class="card"><div class="card-head"><p class="eyebrow">04 / Protokoll</p><h2>Verlauf</h2><p class="muted">Test und Live sind für jeden Eintrag gekennzeichnet.</p></div><div id="history" aria-live="polite"></div><div class="row"><button id="prev" type="button" disabled>Zurück</button><span id="page" class="meta"></span><button id="next" type="button" disabled>Weiter</button></div><hr class="divider"><button id="clear" type="button">Gesamten Verlauf löschen</button></section>
       </div>
       <div id="panel-actions" role="tabpanel" aria-labelledby="tab-actions" tabindex="0" hidden>
-      <section class="card"><div class="card-head"><p class="eyebrow">02 / Freigaben</p><h2>Aktionen</h2><p class="muted">Freigegebene Aktionen dürfen im Live-Betrieb ausgeführt werden. Sensible Aktionen laufen nach Freigabe ohne weitere Bestätigung.</p></div><label class="field">Entität oder Aktion suchen<input id="search" type="search" placeholder="Name, Raum oder Aktion"></label><div id="actions"></div></section>
+      <section class="card"><div class="card-head"><p class="eyebrow">02 / Freigaben</p><h2>Aktionen</h2><p class="muted">Freigegebene Aktionen dürfen im Live-Betrieb ausgeführt werden. Sensible Aktionen laufen nach Freigabe ohne weitere Bestätigung.</p></div><label class="field">Entität oder Aktion suchen<input id="search" type="search" placeholder="Name, Raum oder Aktion"></label><p><button id="reset_actions" type="button">Standardfreigaben wiederherstellen</button></p><div id="actions"></div></section>
       </div>
     </main>`;
     this.$('#menu').addEventListener('click', () => this.dispatchEvent(new Event('hass-toggle-menu', { bubbles: true, composed: true })));
@@ -480,6 +507,7 @@ class AuralisPanel extends HTMLElement {
       this.$(`#${id}`).addEventListener('change', () => this.discoverModels());
     }
     for (const service of ['stt', 'llm']) this.$(`#${service}_token_mode`).addEventListener('change', () => this.tokenMode(service));
+    this.$('#reset_actions').addEventListener('click', () => this.resetActions());
     this.$('#search').addEventListener('input', () => this.renderActions());
     this.$('#llm_form').addEventListener('submit', e => this.testLLM(e));
     this.$('#record').addEventListener('click', () => this.record());

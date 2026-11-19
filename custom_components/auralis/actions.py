@@ -11,6 +11,9 @@ import math
 import re
 
 _ENTITY = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+_DEFAULT_DOMAINS = {"light", "switch", "climate", "fan", "humidifier", "cover", "group", "scene"}
+_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_DND = re.compile(r"(?<![^\W_])(?:d[\W_]*n[\W_]*d|do[\W_]*not[\W_]*disturb)(?![^\W_])", re.I)
 MAX_ACTION_TARGETS = 100
 
 # Parameters are deliberately service-specific: target, area and service names
@@ -136,8 +139,14 @@ class ActionPolicy:
         return domain in {"lock", "alarm_control_panel", "script", "siren", "button", "input_button"} or (domain == "cover" and state.attributes.get("device_class") not in {"blind", "curtain", "shade", "shutter", "awning"})
 
     def _enabled(self, state, action):
-        default = not self._sensitive(state)
-        if state.entity_id.startswith("scene."):
+        default = state.entity_id.partition(".")[0] in _DEFAULT_DOMAINS and not self._sensitive(state)
+        if default:
+            entry = self._registry_entry(state.entity_id)
+            names = state.entity_id, str(state.attributes.get("friendly_name", "")), str(getattr(entry, "name", ""))
+            default = not getattr(entry, "entity_category", None) and not any(
+                _DND.search(name) or _DND.search(_WORD_BOUNDARY.sub(" ", name)) for name in names
+            )
+        if default and state.entity_id.startswith("scene."):
             default = self._scene_safe(state, None, defaults_only=True)
         value = self.overrides.get(f"{state.entity_id}:{action}", default)
         return value is True, default

@@ -10,7 +10,7 @@ from .const import DOMAIN, MAX_AUDIO, MAX_TEXT
 
 
 def register(hass):
-    for handler in (get, save, action, models, test_llm, test_stt, history, audio, clear):
+    for handler in (get, save, action, reset_actions, models, test_llm, test_stt, history, audio, clear):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -39,19 +39,36 @@ async def get(hass, connection, msg):
 async def save(hass, connection, msg):
     async def run():
         bridge = hass.data[DOMAIN]
-        await bridge.save(msg["settings"])
-        return {"settings": bridge.public_settings()}
+        async with bridge.lock:
+            await bridge.save(msg["settings"])
+            return {"settings": bridge.public_settings()}
     await execute(connection, msg, run)
 
 @command("action", {vol.Required("entity_id"): str, vol.Required("action"): str, vol.Required("enabled"): bool})
 async def action(hass, connection, msg):
     async def run():
         bridge = hass.data[DOMAIN]
-        entity = next((e for e in bridge.policy().catalog(user=connection.user) if e["id"] == msg["entity_id"]), None)
-        if not entity or not any(a["id"] == msg["action"] for a in entity["actions"]): raise ValueError()
-        bridge.overrides[f'{msg["entity_id"]}:{msg["action"]}'] = msg["enabled"]
-        await bridge.persist()
-        return {}
+        async with bridge.lock:
+            entity = next((e for e in bridge.policy().catalog(user=connection.user) if e["id"] == msg["entity_id"]), None)
+            if not entity or not any(a["id"] == msg["action"] for a in entity["actions"]): raise ValueError()
+            bridge.overrides[f'{msg["entity_id"]}:{msg["action"]}'] = msg["enabled"]
+            await bridge.persist()
+            return {}
+    await execute(connection, msg, run)
+
+@command("reset_actions", {})
+async def reset_actions(hass, connection, msg):
+    async def run():
+        bridge = hass.data[DOMAIN]
+        async with bridge.lock:
+            previous = bridge.overrides.copy()
+            bridge.overrides.clear()
+            try:
+                await bridge.persist()
+            except Exception:
+                bridge.overrides.update(previous)
+                raise
+            return {"entities": bridge.policy().catalog(user=connection.user)}
     await execute(connection, msg, run)
 
 @command("models", {vol.Required("url"): vol.All(str, vol.Length(max=MAX_TEXT)), vol.Optional("token"): vol.All(str, vol.Length(max=MAX_TEXT))})
