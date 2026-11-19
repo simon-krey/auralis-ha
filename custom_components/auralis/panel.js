@@ -64,6 +64,7 @@ class AuralisPanel extends HTMLElement {
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) this.$(`#${key}`).value = s[key] || '';
     this.$('#llm_reasoning').value = s.llm_reasoning || 'default';
     this.$('#history_enabled').checked = !!s.history_enabled;
+    this.$('#llm_full_context').checked = !!s.llm_full_context;
     for (const service of ['stt', 'llm']) {
       this.$(`#${service}_token`).value = '';
       this.$(`#${service}_token_mode`).value = 'keep';
@@ -137,6 +138,7 @@ class AuralisPanel extends HTMLElement {
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) settings[key] = this.$(`#${key}`).value;
     settings.llm_reasoning = this.$('#llm_reasoning').value;
     settings.history_enabled = this.$('#history_enabled').checked;
+    settings.llm_full_context = this.$('#llm_full_context').checked;
     for (const service of ['stt', 'llm']) {
       const mode = this.$(`#${service}_token_mode`).value;
       if (mode === 'replace') settings[`${service}_token`] = this.$(`#${service}_token`).value;
@@ -217,7 +219,7 @@ class AuralisPanel extends HTMLElement {
     return ({ matched: 'Passende Ziele und Aktionen gefunden', clarify: 'Ziel oder Umfang nicht eindeutig', no_match: 'Kein passendes Ziel mit Aktion', no_action: 'Keine passende freigegebene Aktion', read_only: 'Nur Gerätestatus, keine Aktion', already_set: 'Schon im gewünschten Zustand' })[selection?.status] || '';
   }
   offeredActions(selection) {
-    return Object.keys(selection?.action_parameters || {}).join(', ') || 'keine';
+    return (selection?.offered_actions ?? Object.keys(selection?.action_parameters || {})).join(', ') || 'keine';
   }
   confirmationText(confirmation) {
     if (!confirmation) return '';
@@ -258,9 +260,10 @@ class AuralisPanel extends HTMLElement {
     if (Number.isFinite(details.selection_ms)) timeline.push({ start: details.selection_started_ms, sequence: 0, title: 'Lokale Auswahl', value: this.duration(details.selection_ms) });
     if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
     if (selection) {
-      values.push(['Geräte im Modellkontext', selection.entities], ['Aktionsparameter im Modellkontext', selection.action_parameters]);
+      values.push(['Modus', selection.mode], ['Vollständiger passender Umfang', selection.matched_scope], ['Lokale Auswahl', selection.entities], ['Katalog im Modellkontext', selection.catalog_entities], ['Aktive Aktionen', selection.active_actions ?? selection.action_parameters]);
       if (selection.matches) {
         values.push(['Erkannte Räume', selection.matches.rooms], ['Erkannte Gerätenamen', selection.matches.names]);
+        if (selection.matches.skipped_groups?.length) values.push(['Übersprungene Gruppen', selection.matches.skipped_groups]);
       }
       if (selection.resolved_targets?.length) values.push(['Lokal aufgelöste Sammelziele', selection.resolved_targets]);
     }
@@ -448,7 +451,7 @@ class AuralisPanel extends HTMLElement {
         <div class="grid">
       <section class="card"><div class="card-head"><p class="eyebrow">01 / Verbindung</p><h2>Dienste & Einstellungen</h2><p class="muted">Änderungen gelten nach dem Speichern.</p></div><p id="destinations" class="notice"></p><form id="settings"><h3 class="subheading">Spracheingabe · STT</h3><div class="fields"><label class="field">STT-URL<input id="stt_url" type="url" autocomplete="off"></label><label class="field">Modell<input id="stt_model" autocomplete="off"></label><label class="field">Token <span id="stt_token_state" class="meta"></span><select id="stt_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues STT-Token<input id="stt_token" type="password" autocomplete="new-password" disabled></label></div><h3 class="subheading">Verarbeitung · LLM</h3><div class="fields"><label class="field">LLM-Basis-URL<input id="llm_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label><label class="field">Modell<input id="llm_model" list="llm_models" aria-describedby="model_status" autocomplete="off"><datalist id="llm_models"></datalist></label><label class="field">Token <span id="llm_token_state" class="meta"></span><select id="llm_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues LLM-Token<input id="llm_token" type="password" autocomplete="new-password" disabled></label><div class="wide model-controls"><button id="load_models" type="button">Modelle laden</button><p id="model_status" class="meta" role="status"></p></div>
       <label class="field wide">Reasoning (Thinking)<select id="llm_reasoning" aria-describedby="llm_reasoning_help"><option value="default">Anbieterstandard</option><option value="on">An</option><option value="off">Aus</option></select><small id="llm_reasoning_help">An und Aus setzen Unterstützung für reasoning_effort voraus. Bei Fehlern Anbieterstandard wählen.</small></label>
-      <label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>
+      <label class="checkrow wide"><input id="llm_full_context" type="checkbox" aria-describedby="llm_full_context_help"> Alle Geräte an das LLM senden</label><p id="llm_full_context_help" class="meta wide">Sendet Geräteinformationen an den eingestellten LLM-Endpoint und kann mehr Kontext verbrauchen.</p><label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>
       <section class="card"><div class="card-head"><p class="eyebrow">03 / Test</p><h2>Sprachtest</h2><p class="muted">Eine Aufnahme an das gespeicherte STT-Ziel senden. Maximal 30 Sekunden.</p></div><label class="field">Sprache<input id="stt_language" value="de" autocomplete="off"></label><p class="meta">Mikrofonzugriff benötigt HTTPS oder localhost und deine Erlaubnis.</p><button id="record" type="button">Aufnahme starten</button><p id="stt_result" class="result" role="status" aria-live="polite"></p><hr class="divider"><h3>LLM-Probelauf</h3><p class="meta">Testet die Verarbeitung mit den gespeicherten Einstellungen.</p><form id="llm_form"><label class="field">Sprache<input id="llm_language" value="de" autocomplete="off"></label><label class="field">Testnachricht<textarea id="test_prompt" required></textarea></label><p><button id="llm_test" type="submit">LLM testen</button></p></form><p id="llm_result" class="result" role="status" aria-live="polite"></p></section>
         </div>
       </div>

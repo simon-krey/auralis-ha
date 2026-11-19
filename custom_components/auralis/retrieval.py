@@ -5,7 +5,6 @@ import re
 from .names import EXPLICIT_LOCATION, MATCH_METHODS, match_names, normalize, remove_location
 
 BULK_TARGET = "__all_matching__"
-MAX_CONTEXT_ENTITIES = 6
 _TYPES = {
     "light": "licht lichter beleuchtung lampe lampen leuchte leuchten light lights lamp lamps",
     "switch": "schalter steckdose steckdosen switch switches plug plugs",
@@ -27,6 +26,7 @@ _DOMAINS = {word: domain for domain, words in _TYPES.items() for word in words.s
 _PLURAL_LIGHTS = frozenset("lichter lampen leuchten lights lamps".split())
 _ALL = re.compile(r"\b(?:alle[nrs]?|samtliche[nrs]?|all|every)\b")
 _GLOBAL = re.compile(r"\b(?:uberall|ueberall|everywhere|im ganzen haus|throughout the house)\b")
+_SWITCH_SCOPE_WORDS = frozenset("die das den the ma schalt schalte schalten mach mache machen turn switch set an ein aus on off abschalten einschalten ausschalten anschalten anmachen ausmachen".split())
 _GENERIC_LIGHT_SWITCH = re.compile(r"(?:(?:bitte|please) )?(?:(?:schalte?|mache?|turn|switch) )?(?:(?:die|das|the|alle|samtliche|all|every) )?(?:(?:die|the) )?(?:licht|lichter|beleuchtung|lampe|lampen|leuchten|light|lights|lamp|lamps) (?:an|ein|aus|on|off|ein ?schalten|aus ?schalten|an ?machen|aus ?machen)(?: bitte| please)?")
 _COLLECTIVE_LIGHT_SWITCH = re.compile(r"\b(?:licht|light|beleuchtung)\b")
 _ENGLISH_LIGHT_SWITCH = re.compile(r"(?:please )?(?:turn|switch) (?:on|off) (?:the )?lights?(?: please)?")
@@ -124,7 +124,7 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     room_command = re.sub(r"^((?:schalte?|mache?) )ma ", r"\1", room_command)
     collective_switch = _COLLECTIVE_LIGHT_SWITCH.search(room_command) and _GENERIC_LIGHT_SWITCH.fullmatch(room_command)
     room_lights = len(areas) == 1 and not named and (words & _PLURAL_LIGHTS or collective_switch or _ENGLISH_LIGHT_SWITCH.fullmatch(room_command))
-    bulk = domains == {"light"} and ((explicit_all and (bool(areas) or global_scope or _GENERIC_LIGHT_SWITCH.fullmatch(text))) or room_lights)
+    bulk = (len(domains) == 1 and domains <= {"light", "switch", "fan", "humidifier"} and explicit_all) or (domains == {"light"} and room_lights)
     candidates = []
     if named or areas or domains:
         for entity in (named if named and not bulk else scoped):
@@ -134,7 +134,7 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     action_text = text
     for phrase in sorted(specific | room_phrases, key=len, reverse=True):
         action_text = re.sub(rf"\b{re.escape(phrase)}\b", " ", action_text)
-    action_text = " ".join(action_text.split())
+    action_text = " ".join(_GLOBAL.sub(" ", action_text).split())
     hints = {action for action, pattern in _ACTION_PATTERNS.items() if pattern.search(action_text)}
     if "turn_on" in hints:
         hints.update({"activate", "vacuum_start"})
@@ -145,21 +145,28 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     if "light_set" in hints and "turn_off" not in hints:
         hints.discard("turn_on")
     if _QUESTION.search(text) or _EXCEPTION.search(text) or _DEFERRED.search(action_text):
-        return candidates[:MAX_CONTEXT_ENTITIES], {}, [], "read_only"
+        return candidates, {}, [], "read_only"
+    if re.search(r"\b(?:maybe|perhaps|possibly|vielleicht|eventuell|irgend\w*|somewhere|somehow)\b", text):
+        return candidates, {}, [], "clarify"
     if len(areas) > 1 or (not global_scope and EXPLICIT_LOCATION.search(named_text)):
-        return [], {}, [], "clarify"
+        return candidates, {}, [], "clarify"
     if (not named and (_LOCAL_QUALIFIER.search(text) or (areas and not domains))) or {"turn_on", "turn_off"} <= hints:
-        return [], {}, [], "clarify"
+        return candidates, {}, [], "clarify"
     if bulk:
         if not hints or (named and explicit_all) or len(areas) > 1 or (global_scope and areas):
-            return [], {}, [], "clarify"
+            return candidates, {}, [], "clarify"
+        unparsed_scope = set(_ALL.sub(" ", _GLOBAL.sub(" ", room_command)).split()) - _DOMAINS.keys() - _SWITCH_SCOPE_WORDS
+        if unparsed_scope & {"in", "im", "am", "at", "bei", "inside"} or (hints & {"turn_on", "turn_off"} and unparsed_scope):
+            return candidates, {}, [], "clarify"
+        if trace is not None:
+            trace["skipped_groups"] = [entity["id"] for entity in candidates if entity.get("group")]
         candidates = [entity for entity in candidates if not entity.get("group")]
     elif explicit_all or len(candidates) > 1 or (not areas and not named and re.search(r"\b(?:im|in|am|bei|neben)\b", text)):
-        return [], {}, [], "clarify"
+        return candidates, {}, [], "clarify"
     elif domains == {"light"} and not areas and not named and hints & {"turn_on", "turn_off"} and not _GENERIC_LIGHT_SWITCH.fullmatch(text):
         return [], {}, [], "clarify"
     if not candidates:
-        return [], {}, [], "no_match"
+        return [], {}, [], "clarify" if explicit_all else "no_match"
 
     if not hints and named and _domain(candidates[0]) in {"scene", "script"} and original in specific:
         hints.add("activate")
@@ -173,13 +180,17 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
             return candidates, {}, [], "already_set"
         return candidates, selected, [], "matched" if selected else "no_action"
 
+    if domains != {"light"}:
+        actions = {target: {action: schema for action, schema in items.items() if action in {"turn_on", "turn_off"}} for target, items in actions.items()}
     available = {action for items in actions.values() for action in items}
     if len(available) != 1:
-        return [], {}, [], "clarify" if available else "no_match"
+        return candidates, {}, [], "clarify"
     action = next(iter(available))
     eligible = [entity for entity in candidates if action in actions[entity["id"]]]
+    if trace is not None:
+        trace["scope"] = [{"id": entity["id"], "name": entity["name"], "area": entity["area"], "state": entity["state"], "status": ("not_allowed" if action not in actions[entity["id"]] else "already_set" if (action, entity["state"]) in {("turn_off", "off"), ("turn_on", "on")} else "target")} for entity in candidates]
     targets = [entity["id"] for entity in eligible if (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
-    selection = {"id": BULK_TARGET, "name": "Alle passenden Lampen", "area": candidates[0]["area"] if areas else None, "count": len(targets)}
+    selection = {"id": BULK_TARGET, "name": "Alle passenden Geräte" if domains != {"light"} else "Alle passenden Lampen", "area": candidates[0]["area"] if areas else None, "count": len(targets)}
     if not targets:
         return [selection | {"state": eligible[0]["state"], "count": len(eligible)}], {}, [], "already_set"
     schema = actions[targets[0]][action]

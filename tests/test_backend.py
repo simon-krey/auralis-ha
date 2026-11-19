@@ -308,6 +308,120 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["diagnostics"]["selection"]["resolved_targets"], targets)
         self.assertEqual(result["diagnostics"]["selection"]["entities"][0]["id"], backend.BULK_TARGET)
 
+    async def test_full_context_validates_action_entity_pair(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity("switch.one", "One", None, "turn_on"), entity("fan.two", "Two", None, "turn_off")]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            self.assertIn("fan.two", payload["messages"][0]["content"])
+            return tool_response("turn_on", "fan.two")
+        bridge.request = request
+        with self.assertRaisesRegex(backend.AuralisError, "ungültigen"):
+            await bridge.chat("turn on One", "en", "context", "user", dry_run=True)
+        self.assertEqual(policy.calls, [])
+
+    async def test_full_catalog_is_present_without_granting_tools(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity("light.room", "Desk Lamp", "Room", "turn_off"), entity("fan.obscure", "Obscure", None, "turn_on")]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            content = payload["messages"][0]["content"]
+            self.assertIn('"fan.obscure"', content)
+            self.assertIn('"turn_on"', content)
+            self.assertNotIn('"action_parameters"', content)
+            if payload["messages"][1]["content"].startswith("Which"):
+                self.assertNotIn("tools", payload)
+                return {"choices": [{"message": {"content": "Lamp is on"}}]}
+            self.assertEqual(payload["tools"][0]["function"]["name"], "confirm_action")
+            return confirmation_response(approved=True)
+        bridge.request = request
+        await bridge.chat("Which lights are on?", "en", "context", "user", dry_run=True)
+        await bridge.chat("Turn off Desk Lamp", "en", "context", "user", dry_run=True)
+        self.assertEqual(len(policy.calls), 1)
+
+    async def test_full_unmatched_request_can_use_catalog_pair(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity("fan.hidden", "Hidden", None, "turn_on")]
+        bridge.policy = lambda: policy
+        calls = 0
+        async def request(_kind, *, payload):
+            nonlocal calls
+            calls += 1
+            self.assertIn('"fan.hidden"', payload["messages"][0]["content"])
+            if calls == 1:
+                return tool_response("turn_on", "fan.hidden")
+            return {"choices": [{"message": {"content": "Done"}}]}
+        bridge.request = request
+        await bridge.chat("Start the breeze device", "en", "context", "user", dry_run=True)
+        self.assertEqual(policy.calls[0][0:2], ("turn_on", ["fan.hidden"]))
+
+    async def test_full_read_only_rejects_unoffered_tool(self):
+        bridge = self.bridge()
+        bridge.settings["llm_full_context"] = True
+        policy = Policy()
+        policy.entities = [entity("switch.one", "One", None, "turn_on")]
+        bridge.policy = lambda: policy
+        async def request(_kind, *, payload):
+            self.assertNotIn("tools", payload)
+            return tool_response("turn_on", "switch.one")
+        bridge.request = request
+        with self.assertRaises(backend.AuralisError):
+            await bridge.chat("Is One on?", "en", "context", "user", dry_run=True)
+        self.assertFalse(policy.calls)
+
+    async def test_nonlight_bulk_uses_fixed_scope_and_batches(self):
+        bridge = self.bridge()
+        policy = Policy()
+        policy.entities = [entity(f"switch.s{i}", f"Switch {i}", None, "turn_off") for i in range(101)]
+        policy.entities.append(entity("switch.group", "Group", None, "turn_off", group=True))
+        bridge.policy = lambda: policy
+        requests = 0
+        async def request(_kind, *, payload):
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                return tool_response("turn_off", backend.BULK_TARGET)
+            return {"choices": [{"message": {"content": "Done"}}]}
+        bridge.request = request
+        result = await bridge.chat("Turn off all switches", "en", "context", "user", dry_run=True)
+        self.assertEqual([len(call[1]) for call in policy.calls], [100, 1])
+        self.assertEqual(result["diagnostics"]["selection"]["matches"]["skipped_groups"], ["switch.group"])
+
+    def test_ambiguous_context_keeps_candidates_without_actions(self):
+        catalog = [entity("fan.one", "Fan one", "Kitchen", "turn_off"), entity("fan.two", "Fan two", "Kitchen", "turn_off")]
+        candidates, actions, targets, status = backend.select_context("Turn off the fan near the Kitchen", catalog, language="en")
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual((actions, targets, status), ({}, [], "clarify"))
+
+    def test_global_bulk_scope_and_read_only_recall(self):
+        catalog = [entity(f"light.l{i}", f"Device {i}", None if i % 2 else "Room", "turn_off", state="off" if i == 0 else "on") for i in range(12)]
+        trace = {}
+        _, _, targets, status = backend.select_context("schalte alle lampen aus", catalog, trace=trace)
+        self.assertEqual(status, "matched")
+        self.assertEqual(len(targets), 11)
+        self.assertEqual(len(trace["scope"]), 12)
+        self.assertEqual(trace["scope"][0]["status"], "already_set")
+        selected, actions, _, _ = backend.select_context("Welche Lampen sind an?", catalog)
+        self.assertEqual(len(selected), 12)
+        self.assertFalse(actions)
+
+    def test_bulk_never_expands_unknown_rooms_or_device_qualifiers(self):
+        catalog = [entity("light.one", "Deckenlampe", "Küche", "turn_off"),
+                   entity("light.two", "Stehlampe", "Flur", "turn_off"),
+                   entity("fan.one", "Ventilator", "Küche", "turn_off")]
+        for prompt in ("Schalte alle Lampen in Garage aus", "Schalte alle roten Lampen aus", "Turn off all fans in Garage"):
+            with self.subTest(prompt=prompt):
+                _, actions, targets, status = backend.select_context(prompt, catalog)
+                self.assertEqual((actions, targets, status), ({}, [], "clarify"))
+        self.assertEqual(backend.select_context("Schalte alle Lampen aus im ganzen Haus", catalog)[2], ["light.one", "light.two"])
+        self.assertEqual(backend.select_context("Schalte alle Ventilatoren in Küche aus", catalog)[2], ["fan.one"])
+
     def test_collective_room_light_command_and_explicit_single_lamp(self):
         catalog = [entity("light.bed_one", "Leselampe", "Schlafzimmer", "turn_off"),
                    entity("light.bed_two", "Deckenlampe", "Schlafzimmer", "turn_off"),

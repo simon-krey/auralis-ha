@@ -135,7 +135,7 @@ class Bridge:
             raise ValueError("Ungültige Einstellungen")
         new = dict(self.settings)
         for key, value in values.items():
-            if key == "history_enabled":
+            if key in {"history_enabled", "llm_full_context"}:
                 if not isinstance(value, bool): raise ValueError("Ungültige Einstellungen")
             elif not isinstance(value, str) or len(value) > MAX_TEXT:
                 raise ValueError("Ungültige Einstellungen")
@@ -328,40 +328,64 @@ class Bridge:
             selection_started = time.perf_counter()
             policy = self.policy()
             matches = {}
-            candidates, enabled, bulk_targets, selection = select_context(prompt, policy.catalog(user=user, for_retrieval=True), trace=matches, language=language)
+            catalog = policy.catalog(user=user, for_retrieval=True)
+            candidates, enabled, bulk_targets, selection = select_context(prompt, catalog, trace=matches, language=language)
             inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates]
             details["selection_ms"] = elapsed_ms(selection_started)
             details["selection_started_ms"] = round((selection_started - started) * 1000)
-            details["selection"] = {"status": selection, "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets}
+            details["selection"] = {"status": selection, "mode": "all" if self.settings["llm_full_context"] else "filtered", "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets, "matched_scope": matches.pop("scope", [])}
             english = (language or "").lower().startswith("en")
             if selection == "already_set":
                 target = inventory[0]
                 state = target["state"]
                 plural = target.get("count", 1) > 1
+                nonlight = target["id"] == BULK_TARGET and details["selection"]["matched_scope"] and not details["selection"]["matched_scope"][0]["id"].startswith("light.")
+                if nonlight:
+                    return await finish(("The devices are already " + state + ".") if english else ("Die Geräte sind schon " + ("an." if state == "on" else "aus.")))
                 if english:
                     return await finish(f"The lights are already {state}." if plural else f"The light is already {state}.")
                 return await finish(f"{'Die Lampen sind' if plural else 'Die Lampe ist'} schon {'an' if state == 'on' else 'aus'}.")
+            full_actions = {}
+            full_mode = self.settings["llm_full_context"]
+            catalog_inventory = []
+            if full_mode:
+                for entity in catalog:
+                    actions = {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True}
+                    catalog_inventory.append({key: entity[key] for key in ("id", "name", "area", "state") if key in entity} | {"actions": actions})
+                    full_actions[entity["id"]] = {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and (not item.get("sensitive") or (entity in candidates and item["id"] in enabled and not any(match["method"] in {"phonetic", "edit_distance"} for match in matches.get("names", []) + matches.get("rooms", [])) ))}
             allowed_ids = [entity["id"] for entity in inventory] if enabled else []
             prepared = None
             if len(enabled) == 1 and len(candidates) == 1:
                 candidate = candidates[0]
                 action = next(iter(enabled))
-                if action in {"turn_on", "turn_off"} and (bulk_targets or (candidate["id"].startswith("light.") and not candidate.get("group"))):
+                if action in {"turn_on", "turn_off"} and ((bulk_targets and all(target.startswith("light.") for target in bulk_targets)) or (candidate["id"].startswith("light.") and not candidate.get("group"))):
                     prepared = action
+            active_pairs = {}
+            if full_mode and selection not in {"clarify", "read_only"} and not bulk_targets and not prepared:
+                active_pairs = {key: value for key, value in full_actions.items() if value}
+                enabled = {action: schema for actions in active_pairs.values() for action, schema in actions.items()}
+                allowed_ids = list(active_pairs)
+            details["selection"]["catalog_entities"] = catalog_inventory if full_mode else []
+            details["selection"]["active_actions"] = active_pairs if active_pairs else enabled
+            details["selection"]["offered_actions"] = sorted(enabled)
             unconfirmed = "I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen."
-            model_context = {"entities": inventory}
+            model_context = {"entities": catalog_inventory if full_mode else inventory}
+            if full_mode:
+                model_context["local_selection"] = inventory
+                model_context["scope_note"] = "Entities and actions are a catalog, not authorization. Only the offered tool and its fixed or validated scope may be used."
             if prepared:
                 model_context["prepared_action"] = prepared
                 details["confirmation"] = {"action": prepared, "state": "pending"}
             else:
-                model_context["action_parameters"] = enabled
+                if not full_mode:
+                    model_context["action_parameters"] = enabled
             inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
             if len(inventory_text) > 100000: raise AuralisError("Geräteliste zu groß für die LLM-Anfrage.")
             tools = []
             if prepared:
                 tools = [{"type":"function", "function":{"name":"confirm_action", "description":"Validate the fixed light action against the user's request. Approve only if the action and target match.", "parameters":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"], "additionalProperties":False}}}]
             elif enabled:
-                tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string", "enum":allowed_ids}, "minItems":1, "maxItems":1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
+                tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string", "enum":allowed_ids}, "minItems":1, "maxItems":8 if active_pairs else 1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
             if prepared:
                 verifier = "Check whether the fixed action and target match the explicit request. A group target represents all matching lights in the listed room, or all matching lights if no room is listed. Only call confirm_action with approved=true if it matches, otherwise approved=false. Do not change the plan.\nPlan: " if english else "Prüfe, ob die feste Aktion und das Ziel zur ausdrücklichen Anfrage passen. Ein Sammelziel umfasst alle passenden Lampen im angegebenen Raum, oder überall, wenn kein Raum angegeben ist. Rufe nur confirm_action auf: approved=true, wenn der Plan passt, sonst approved=false. Ändere den Plan nicht.\nPlan: "
                 system_text = verifier + inventory_text
@@ -369,7 +393,7 @@ class Bridge:
                 system_text = self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text
             messages = [{"role":"system", "content":system_text}, {"role":"user", "content":prompt}]
             if bulk_targets and not prepared:
-                messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID."
+                messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID und keine Parameter. Berichte das tatsächliche Werkzeugergebnis einschließlich Fehlern oder übersprungener Geräte."
             elif selection == "clarify":
                 messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
             elif not enabled:
@@ -422,7 +446,7 @@ class Bridge:
                         action = args.get("action")
                         ids = args.get("entity_ids")
                         params = args.get("parameters")
-                        if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or len(ids) != 1 or ids[0] not in allowed_ids or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
+                        if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or not 1 <= len(ids) <= (8 if active_pairs else 1) or any(not isinstance(target, str) or target not in allowed_ids or (active_pairs and action not in active_pairs.get(target, {})) for target in ids) or len(set(ids)) != len(ids) or (bulk_targets and params != {}) or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
                             raise AuralisError("Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf.")
                     tool_started = time.perf_counter()
                     if bulk_targets:
