@@ -19,6 +19,8 @@ MAX_HISTORY = 99 * 1024 * 1024
 MAX_AGE = 7 * 86400
 MAX_RESPONSE = 1024 * 1024
 MAX_ERROR = 2000
+_REASONING = re.compile(r"<(think|thinking|analysis|reasoning)\b[^>]*>(.*?)(?:</\1\s*>|$)", re.I | re.S)
+_ORPHAN_REASONING_END = re.compile(r"^.*</(?:think|thinking|analysis|reasoning)\s*>", re.I | re.S)
 
 
 class AuralisError(ValueError):
@@ -52,9 +54,23 @@ def diagnostic(error):
 
 
 def clean(text):
-    text = re.sub(r"<(think|thinking|analysis|reasoning)\b[^>]*>.*?</\1\s*>", "", str(text), flags=re.I | re.S)
-    text = re.sub(r"<(think|thinking|analysis|reasoning)\b[^>]*>.*", "", text, flags=re.I | re.S)
+    text = _ORPHAN_REASONING_END.sub("", _REASONING.sub("", str(text)))
     return text.strip()[:MAX_TEXT]
+
+
+def provider_reasoning(message):
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    content = message.get("content")
+    if not isinstance(content, str):
+        return ""
+    snippets = [match[2].strip() for match in _REASONING.finditer(content)]
+    orphan = _ORPHAN_REASONING_END.search(_REASONING.sub("", content))
+    if orphan:
+        snippets.append(orphan[0].rsplit("</", 1)[0].strip())
+    return "\n".join(filter(None, snippets))
 
 
 def history_sizes(entries):
@@ -63,6 +79,20 @@ def history_sizes(entries):
 
 def elapsed_ms(started):
     return round((time.perf_counter() - started) * 1000)
+
+
+def switch_response(action, result, *, dry_run, english):
+    count = len(result["planned" if dry_run else "executed"])
+    missed = len(result["skipped"]) + len(result["errors"])
+    if not count:
+        return "I couldn't switch any of the lights." if english else "Ich konnte keine der Lampen schalten."
+    if english:
+        state = "on" if action == "turn_on" else "off"
+        return f"{count} {'light' if count == 1 else 'lights'} {'would be' if dry_run else 'were' if count != 1 else 'was'} turned {state}." + (" Some targets couldn't be switched." if missed else "")
+    subject = "Eine Lampe" if count == 1 else f"{count} Lampen"
+    verb = ("würde" if count == 1 else "würden") if dry_run else ("wurde" if count == 1 else "wurden")
+    state = "eingeschaltet" if action == "turn_on" else "ausgeschaltet"
+    return f"{subject} {verb} {state}." + (" Nicht alle Ziele waren schaltbar." if missed else "")
 
 
 def valid_url(url):
@@ -209,9 +239,11 @@ class Bridge:
         except Exception as error:
             raise AuralisError(diagnostic(error)) from None
 
-    async def timed_request(self, kind, details, **kwargs):
+    async def timed_request(self, kind, details, origin, *, sequence=1, **kwargs):
         started = time.perf_counter()
-        request = {"offered_tools": bool((kwargs.get("payload") or {}).get("tools"))} if kind == "llm" else {}
+        request = {"started_ms": round((started - origin) * 1000), "sequence": sequence}
+        if kind == "llm":
+            request["offered_tools"] = bool((kwargs.get("payload") or {}).get("tools"))
         details["requests"].append(request)
         try:
             data = await self.request(kind, **kwargs)
@@ -242,7 +274,7 @@ class Bridge:
                 form.add_field("language", language[:35].split("-")[0])
             extension = {"audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/mp4": "m4a"}.get(mime, mime.split("/")[1])
             form.add_field("file", audio, filename=f"audio.{extension}", content_type=mime)
-            data = await self.timed_request("stt", details, form=form)
+            data = await self.timed_request("stt", details, started, form=form)
             if not isinstance(data, dict) or not isinstance(data.get("text"), str):
                 raise AuralisError("In der STT-Antwort fehlt das Textfeld text.")
             transcript = data["text"][:MAX_TEXT]
@@ -260,23 +292,52 @@ class Bridge:
         details = {} if details is None else details
         details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[])
         results = []
+
+        async def finish(answer):
+            details["duration_ms"] = elapsed_ms(started)
+            await self.record("llm", dry_run, input=prompt, answer=answer, tools=results, diagnostics=details)
+            return {"answer": answer, "tools": results, "diagnostics": details}
+
         try:
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_TEXT:
                 raise AuralisError("Eine Eingabe mit 1 bis 16.000 Zeichen ist erforderlich.")
             selection_started = time.perf_counter()
             policy = self.policy()
-            candidates, enabled, bulk_targets, selection = select_context(prompt, policy.catalog(user=user, for_retrieval=True))
+            matches = {}
+            candidates, enabled, bulk_targets, selection = select_context(prompt, policy.catalog(user=user, for_retrieval=True), trace=matches, language=language)
             inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates]
             details["selection_ms"] = elapsed_ms(selection_started)
-            details["selection"] = {"status": selection, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets}
+            details["selection_started_ms"] = round((selection_started - started) * 1000)
+            details["selection"] = {"status": selection, "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets}
             allowed_ids = [entity["id"] for entity in inventory] if enabled else []
-            inventory_text = json.dumps({"entities": inventory, "action_parameters": enabled}, ensure_ascii=False, separators=(",", ":"))
+            prepared = None
+            if len(enabled) == 1 and len(candidates) == 1:
+                candidate = candidates[0]
+                action = next(iter(enabled))
+                if action in {"turn_on", "turn_off"} and (bulk_targets or (candidate["id"].startswith("light.") and not candidate.get("group"))):
+                    prepared = action
+            english = (language or "").lower().startswith("en")
+            unconfirmed = "I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen."
+            model_context = {"entities": inventory}
+            if prepared:
+                model_context["prepared_action"] = prepared
+                details["confirmation"] = {"action": prepared, "state": "pending"}
+            else:
+                model_context["action_parameters"] = enabled
+            inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
             if len(inventory_text) > 100000: raise AuralisError("Geräteliste zu groß für die LLM-Anfrage.")
             tools = []
-            if enabled:
+            if prepared:
+                tools = [{"type":"function", "function":{"name":"confirm_action", "description":"Validate the fixed light action against the user's request. Approve only if the action and target match.", "parameters":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"], "additionalProperties":False}}}]
+            elif enabled:
                 tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":{"type":"string", "enum":sorted(enabled)}, "entity_ids":{"type":"array", "items":{"type":"string", "enum":allowed_ids}, "minItems":1, "maxItems":1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
-            messages = [{"role":"system", "content":self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text}, {"role":"user", "content":prompt}]
-            if bulk_targets:
+            if prepared:
+                verifier = "Check whether the fixed action and target match the explicit request. A group target represents all matching lights in the listed room, or all matching lights if no room is listed. Only call confirm_action with approved=true if it matches, otherwise approved=false. Do not change the plan.\nPlan: " if english else "Prüfe, ob die feste Aktion und das Ziel zur ausdrücklichen Anfrage passen. Ein Sammelziel umfasst alle passenden Lampen im angegebenen Raum, oder überall, wenn kein Raum angegeben ist. Rufe nur confirm_action auf: approved=true, wenn der Plan passt, sonst approved=false. Ändere den Plan nicht.\nPlan: "
+                system_text = verifier + inventory_text
+            else:
+                system_text = self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text
+            messages = [{"role":"system", "content":system_text}, {"role":"user", "content":prompt}]
+            if bulk_targets and not prepared:
                 messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID."
             elif selection == "clarify":
                 messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
@@ -286,31 +347,51 @@ class Bridge:
                 messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
             if language:
                 messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
-            if dry_run:
+            if dry_run and not prepared:
                 messages[0]["content"] += "\nTrockenlauf: Es wird nichts geschaltet. Beschreibe geplante Aktionen als Vorschau."
             for round_index in range(4):
                 payload = {"model": self.settings["llm_model"], "messages":messages}
                 if tools and round_index < 3:
                     payload["tools"] = tools
-                data = await self.timed_request("llm", details, payload=payload)
+                data = await self.timed_request("llm", details, started, sequence=1 + round_index + len(results), payload=payload)
                 msg = data["choices"][0]["message"]
                 calls = msg.get("tool_calls") or []
-                details["requests"][-1]["tool_calls"] = len(calls)
+                request = details["requests"][-1]
+                request["tool_calls"] = len(calls)
+                reasoning = provider_reasoning(msg)
+                if reasoning:
+                    request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"])
+                if prepared:
+                    if not calls:
+                        details["confirmation"]["state"] = "missing"
+                        return await finish(unconfirmed)
+                    details["confirmation"]["state"] = "invalid"
+                    if not isinstance(calls, list) or len(calls) != 1 or calls[0]["function"]["name"] != "confirm_action":
+                        raise AuralisError("Die Anbieterantwort enthält keinen gültigen Bestätigungsaufruf für die vorbereitete Aktion.")
+                    approval = json.loads(calls[0]["function"]["arguments"])
+                    if not isinstance(approval, dict) or set(approval) != {"approved"} or type(approval["approved"]) is not bool:
+                        raise AuralisError("Das Modell darf die vorbereitete Aktion nur bestätigen oder ablehnen, nicht verändern.")
+                    details["confirmation"]["state"] = "approved" if approval["approved"] else "rejected"
+                    if not approval["approved"]:
+                        return await finish(unconfirmed)
                 if not calls:
-                    answer = clean(msg.get("content") or "")
-                    details["duration_ms"] = elapsed_ms(started)
-                    await self.record("llm", dry_run, input=prompt, answer=answer, tools=results, diagnostics=details)
-                    return {"answer": answer, "tools": results, "diagnostics": details}
+                    content = msg.get("content") or ""
+                    if reasoning and isinstance(content, str):
+                        content = content.lstrip().removeprefix(reasoning)
+                    return await finish(clean(content))
                 if round_index == 3 or len(calls) > 8 or (bulk_targets and (results or len(calls) != 1)): raise AuralisError("Zu viele Werkzeugaufrufe in der Anbieterantwort.")
                 messages.append({"role":"assistant", "content":None, "tool_calls":calls})
                 for call in calls:
-                    function = call["function"]
-                    args = json.loads(function["arguments"])
-                    action = args.get("action")
-                    ids = args.get("entity_ids")
-                    params = args.get("parameters")
-                    if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or len(ids) != 1 or ids[0] not in allowed_ids or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
-                        raise AuralisError("Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf.")
+                    if prepared:
+                        action, ids, params = prepared, allowed_ids, {}
+                    else:
+                        function = call["function"]
+                        args = json.loads(function["arguments"])
+                        action = args.get("action")
+                        ids = args.get("entity_ids")
+                        params = args.get("parameters")
+                        if function["name"] != "run_action" or not isinstance(action, str) or action not in enabled or not isinstance(ids, list) or len(ids) != 1 or ids[0] not in allowed_ids or not isinstance(params, dict) or len(json.dumps(params)) > MAX_TEXT:
+                            raise AuralisError("Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf.")
                     tool_started = time.perf_counter()
                     if bulk_targets:
                         ids = bulk_targets
@@ -323,7 +404,9 @@ class Bridge:
                         result = await policy.run(action, ids, params, context, dry_run=dry_run, user=user)
                     logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
                     visible_result = {key: len(items) for key, items in result.items()} if bulk_targets else result | {"errors": [{key: value for key, value in error.items() if key != "detail"} for error in result.get("errors", [])]}
-                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "duration_ms":elapsed_ms(tool_started)})
+                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "sequence":1 + len(details["requests"]) + len(results), "started_ms":round((tool_started - started) * 1000), "duration_ms":elapsed_ms(tool_started)})
+                    if prepared:
+                        return await finish(switch_response(action, result, dry_run=dry_run, english=english))
                     messages.append({"role":"tool", "tool_call_id":call["id"], "content":json.dumps(visible_result, ensure_ascii=False)[:MAX_TEXT]})
             raise AuralisError("Zu viele Werkzeugrunden ohne finale LLM-Antwort.")
         except Exception as error:

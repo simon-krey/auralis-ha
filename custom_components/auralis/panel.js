@@ -217,14 +217,20 @@ class AuralisPanel extends HTMLElement {
   offeredActions(selection) {
     return Object.keys(selection?.action_parameters || {}).join(', ') || 'keine';
   }
+  confirmationText(confirmation) {
+    if (!confirmation) return '';
+    const state = ({ pending: 'keine Antwort erhalten', missing: 'keine Bestätigung erhalten', approved: 'bestätigt', rejected: 'abgelehnt', invalid: 'ungültige Bestätigung' })[confirmation.state];
+    return state ? `Vorbereitete Aktion: ${confirmation.action} · ${state}` : '';
+  }
   testDiagnostics(details) {
     if (!details) return '';
     const lines = [];
     if (Number.isFinite(details.duration_ms)) lines.push(`Verarbeitungszeit: ${this.duration(details.duration_ms)}`);
     if (details.selection) lines.push(`An das LLM übergebene Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
+    lines.push(this.confirmationText(details.confirmation));
     return lines.filter(Boolean).map(line => `\n${line}`).join('');
   }
-  appendDiagnostics(article, details) {
+  appendDiagnostics(article, details, tools) {
     if (!details) return;
     const selection = details.selection;
     const timing = [details.model, details.language, Number.isFinite(details.duration_ms) ? `Verarbeitungszeit: ${this.duration(details.duration_ms)}` : ''].filter(Boolean);
@@ -237,13 +243,23 @@ class AuralisPanel extends HTMLElement {
       summary.textContent = `An das LLM übergebene Aktionen: ${this.offeredActions(selection)}${this.selectionText(selection) ? ` · ${this.selectionText(selection)}` : ''}`;
       article.append(summary);
     }
+    const confirmation = this.confirmationText(details.confirmation);
+    if (confirmation) {
+      const summary = document.createElement('p');
+      summary.textContent = confirmation;
+      article.append(summary);
+    }
     const disclosure = document.createElement('details');
     const title = document.createElement('summary'); title.textContent = 'Verarbeitungsdetails'; disclosure.append(title);
     const values = [];
-    if (Number.isFinite(details.selection_ms)) values.push(['Lokale Auswahl', this.duration(details.selection_ms)]);
+    const timeline = [];
+    if (Number.isFinite(details.selection_ms)) timeline.push({ start: details.selection_started_ms, sequence: 0, title: 'Lokale Auswahl', value: this.duration(details.selection_ms) });
     if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
     if (selection) {
       values.push(['Geräte im Modellkontext', selection.entities], ['Aktionsparameter im Modellkontext', selection.action_parameters]);
+      if (selection.matches) {
+        values.push(['Erkannte Räume', selection.matches.rooms], ['Erkannte Gerätenamen', selection.matches.names]);
+      }
       if (selection.resolved_targets?.length) values.push(['Lokal aufgelöste Sammelziele', selection.resolved_targets]);
     }
     for (const [index, round] of (details.requests || []).entries()) {
@@ -252,7 +268,15 @@ class AuralisPanel extends HTMLElement {
       if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe angefordert`);
       if (round.failed) parts.push('fehlgeschlagen');
       if (round.usage) parts.push(`${[Number.isFinite(round.usage.prompt_tokens) && `${round.usage.prompt_tokens} Eingabe`, Number.isFinite(round.usage.completion_tokens) && `${round.usage.completion_tokens} Ausgabe`, Number.isFinite(round.usage.total_tokens) && `${round.usage.total_tokens} gesamt`].filter(Boolean).join(' / ')} Tokens`);
-      values.push([`API-Anfrage ${index + 1}`, parts.filter(Boolean).join(' · ')]);
+      timeline.push({ start: round.started_ms, sequence: round.sequence, title: `API-Anfrage ${index + 1}`, value: parts.filter(Boolean).join(' · '), reasoning: round.reasoning });
+    }
+    for (const call of tools || []) {
+      if (Number.isFinite(call.started_ms)) timeline.push({ start: call.started_ms, sequence: call.sequence, title: `Werkzeug: ${call.action}`, value: this.duration(call.duration_ms) });
+    }
+    timeline.sort((left, right) => (left.start ?? 0) - (right.start ?? 0) || (left.sequence ?? 0) - (right.sequence ?? 0));
+    for (const step of timeline) {
+      values.push([[Number.isFinite(step.start) ? `+${this.duration(step.start)}` : '', step.title].filter(Boolean).join(' · '), step.value]);
+      if (step.reasoning) values.push([`Modell-Thinking · ${step.title}`, step.reasoning]);
     }
     for (const [label, value] of values) this.appendHistoryField(disclosure, label, value);
     if (values.length) article.append(disclosure);
@@ -350,7 +374,7 @@ class AuralisPanel extends HTMLElement {
         const article = document.createElement('article'); article.className = 'history-entry';
         const date = new Date(entry.time || '');
         const head = document.createElement('h3'); head.textContent = `${entry.test ? 'Test' : 'Live'} · ${entry.kind?.toUpperCase() || 'Eintrag'} · ${Number.isNaN(date.getTime()) ? 'Zeit unbekannt' : date.toLocaleString('de-DE')}${entry.error ? ' · Fehler' : ''}`; article.append(head);
-        this.appendDiagnostics(article, entry.diagnostics);
+        this.appendDiagnostics(article, entry.diagnostics, entry.tools);
         for (const [key, label] of [['input', 'Eingabe'], ['transcript', 'Transkript'], ['answer', 'Antwort'], ['error', 'Fehler']]) {
           if (entry[key] == null || entry[key] === '') continue;
           this.appendHistoryField(article, label, entry[key], key === 'error');
@@ -359,7 +383,7 @@ class AuralisPanel extends HTMLElement {
           const calls = document.createElement('details');
           const label = document.createElement('summary'); label.textContent = `Werkzeugaufrufe (${entry.tools.length}${entry.test ? ', Trockenlauf' : ''})`; calls.append(label);
           for (const call of entry.tools) {
-            const { action, duration_ms, ...data } = call;
+            const { action, started_ms, sequence, duration_ms, ...data } = call;
             this.appendHistoryField(calls, [action, this.duration(duration_ms)].filter(Boolean).join(' · '), data);
           }
           article.append(calls);
