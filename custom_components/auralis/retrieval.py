@@ -16,7 +16,7 @@ _TYPES = {
     "lock": "schloss schlosser lock locks",
     "alarm_control_panel": "alarm alarmanlage",
     "climate": "heizung thermostat thermostate klimaanlage klima heating thermostats ac",
-    "media_player": "lautsprecher fernseher speaker speakers tv",
+    "media_player": "lautsprecher fernseher speaker speakers tv television",
     "vacuum": "saugroboter staubsauger vacuum",
     "scene": "szene szenen scene scenes",
     "script": "skript skripte script scripts",
@@ -70,6 +70,45 @@ _ACTION_WORDS = {
     "alarm_arm_home": r"anwesend\w*|arm home",
 }
 _ACTION_PATTERNS = {action: re.compile(rf"\b(?:{pattern})\b") for action, pattern in _ACTION_WORDS.items()}
+_COORDINATOR = re.compile(r"\b(?:und|and)\b")
+_TARGET_GRAMMAR = _FILLER | _DOMAINS.keys() | set("to dim make change both beide beiden also auch wieder again kelvin degree degrees prozent percent setze einschalten ausschalten abschalten ausmachen anmachen".split())
+_UNSUPPORTED_SCOPE = re.compile(r"\b(?:entweder|either|oder|or|samt|sowie|plus|zusammen mit|along with|as well as|together with|bevor|nachdem|before|after|while|wahrend|solange)\b")
+_MEASURE_WORDS = re.compile(r"\b\d+(?: \d+)? (?:prozent|percent|grad|degrees?|kelvin)\b")
+
+
+def _target_spans(text, names, generic, *, german):
+    exact = match_names(text, names, generic=generic, german=german)
+    protected = {phrase for group in exact.values() for method, phrase in group if method < 2}
+    boundaries = [item for item in _COORDINATOR.finditer(text) if not any(
+        match.start() <= item.start() < match.end()
+        for phrase in protected if _COORDINATOR.search(phrase)
+        for match in re.finditer(rf"\b{re.escape(phrase)}\b", text)
+    )]
+    if not boundaries:
+        return exact, [], False
+    matches, spans, incomplete = {}, [], False
+    start = 0
+    for boundary in [*boundaries, None]:
+        end = boundary.start() if boundary else len(text)
+        expression = text[start:end].strip()
+        found = match_names(expression, names, generic=generic, german=german)
+        spans.append({"start": start, "end": end, "expression": expression, "candidates": sorted(found), "status": "resolved" if len(found) == 1 else "ambiguous" if found else "unresolved"})
+        if len(found) != 1:
+            incomplete = True
+        for target, evidence in found.items():
+            matches.setdefault(target, set()).update(evidence)
+            remainder = expression
+            for _, phrase in sorted(evidence, key=lambda item: -len(item[1])):
+                remainder = re.sub(rf"\b{re.escape(phrase)}\b", " ", remainder)
+            remainder = _MEASURE_WORDS.sub(" ", remainder)
+            for pattern in _ACTION_PATTERNS.values():
+                remainder = pattern.sub(" ", remainder)
+            if set(remainder.split()) - _TARGET_GRAMMAR - generic:
+                incomplete = True
+                spans[-1]["status"] = "unresolved"
+        if boundary:
+            start = boundary.end()
+    return matches or exact, spans, incomplete
 
 
 def _domain(entity):
@@ -88,7 +127,7 @@ def _matches_domain(entity, domains, words):
     return True
 
 
-def select_context(prompt, catalog, *, trace=None, language="de"):
+def select_context(prompt, catalog, *, trace=None, language="de", strict=False, keep_noops=False):
     german = (language or "de").lower().split("-")[0].split("_")[0] == "de"
     def normalize_name(value):
         normalized = normalize(value)
@@ -98,7 +137,9 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     rooms = {}
     for entity in catalog:
         if entity["area"]:
-            rooms.setdefault(entity.get("area_id", entity["area"]), set()).update(normalize_name(value) for value in (entity["area"], *entity.get("area_aliases", ())) if value)
+            rooms.setdefault(("area", entity.get("area_id", entity["area"])), set()).update(normalize_name(value) for value in (entity["area"], *entity.get("area_aliases", ())) if value)
+        if strict and entity.get("floor"):
+            rooms.setdefault(("floor", entity["floor_id"]), set()).update(normalize_name(value) for value in (entity["floor"], *entity.get("floor_aliases", ())) if value)
     room_prefixes = {phrase for phrases in rooms.values() for phrase in phrases if phrase and " " not in phrase}
     prefix_lengths = sorted({len(phrase) for phrase in room_prefixes})
     compounds = {word: f"{word[:split]} {word[split:]}" for word in set(original.split()) for split in prefix_lengths if word[:split] in room_prefixes and word[split:] in _DOMAINS}
@@ -113,14 +154,23 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
     domains = {_DOMAINS[word] for word in words & _DOMAINS.keys()}
     if domains & {"climate", "light"} and not words & {"sensor", "sensoren"}:
         domains.discard("sensor")
-    scoped = [entity for entity in catalog if not areas or entity.get("area_id", entity["area"]) in areas]
+    scoped = [entity for entity in catalog if not areas or ("area", entity.get("area_id", entity["area"])) in areas or ("floor", entity.get("floor_id")) in areas]
     names = {entity["id"]: {normalize_name(value) for value in (entity["name"], entity["id"], *entity.get("aliases", ()))} for entity in scoped}
-    matches = match_names(named_text, names, generic=_DOMAINS.keys() | room_phrases, german=german)
+    generic = _DOMAINS.keys() | room_phrases
+    matches, spans, incomplete = _target_spans(named_text, names, generic, german=german)
     specific = {phrase for group in matches.values() for _, phrase in group}
     named = [entity for entity in scoped if entity["id"] in matches]
     if trace is not None:
         for key, found in (("rooms", area_matches), ("names", matches)):
-            trace[key] = [{"id": target, "heard": phrase, "method": MATCH_METHODS[method]} for target, group in sorted(found.items())[:20] for method, phrase in [min(group)]]
+            trace[key] = [{"id": target[1] if key == "rooms" else target, "heard": phrase, "method": MATCH_METHODS[method]} for target, group in sorted(found.items())[:20] for method, phrase in [min(group)]]
+        if spans:
+            trace["target_spans"] = spans
+        if strict:
+            trace["name_spans"] = [
+                {"id": target, "start": occurrence.start(), "end": occurrence.end(), "method": MATCH_METHODS[method]}
+                for target, group in sorted(matches.items()) for method, phrase in sorted(group)
+                for occurrence in re.finditer(rf"\b{re.escape(phrase)}\b", named_text)
+            ][:50]
     global_scope = bool(_GLOBAL.search(text))
     explicit_all = bool(_ALL.search(text))
     room_command = named_text
@@ -149,13 +199,20 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
         hints.update({"media_stop", "vacuum_pause"})
     if words & {"prozent", "percent"} or re.search(r"\d\s*%", prompt):
         hints.update({"light_set", "fan_set_percentage", "set_position", "volume_set", "set_value"})
+    if strict and "kelvin" in words:
+        hints.add("light_set")
     if "light_set" in hints and "turn_off" not in hints:
         hints.discard("turn_on")
     if _QUESTION.search(text) or _EXCEPTION.search(text) or _DEFERRED.search(action_text):
         if trace is not None:
             trace["reason"] = "read_only_expression"
         return candidates, {}, [], "read_only"
-    if _NUMBER_LIST.search(text):
+    action_words = set(action_text.split())
+    if strict and (_UNSUPPORTED_SCOPE.search(action_text) or _LOCAL_QUALIFIER.search(action_text) or (action_words & {"an", "on", "ein"} and action_words & {"aus", "off"})):
+        if trace is not None:
+            trace["reason"] = "unsupported_scope"
+        return candidates, {}, [], "clarify"
+    if _NUMBER_LIST.search(text) and not (strict and re.search(r"\d[.,]\d", prompt)):
         if trace is not None:
             trace["reason"] = "unresolved_number_list"
         return candidates[:3], {}, [], "clarify"
@@ -167,6 +224,11 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
         return [], {}, [], "clarify"
     if len(areas) > 1:
         return candidates, {}, [], "clarify"
+    coordinated = bool(spans and named)
+    if incomplete and (strict or coordinated and not bulk):
+        if trace is not None:
+            trace["reason"] = "incomplete_target_set"
+        return candidates, {}, [], "clarify"
     # Only unmatched words suggest an unknown target; never turn these suggestions into actions.
     if not named and (hints or explicit_all or domains or areas):
         remainder = text
@@ -174,8 +236,9 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
             remainder = re.sub(rf"\b{re.escape(phrase)}\b", " ", remainder)
         for pattern in _ACTION_PATTERNS.values():
             remainder = pattern.sub(" ", remainder)
-        unknown = [word for word in remainder.split() if word not in _FILLER and word not in _DOMAINS and not word.isdigit()][:20]
-        numbered = bool(re.search(r"\b\d+\b", remainder)) and not (words & {"prozent", "percent", "grad", "degree", "degrees"} or "%" in prompt)
+        vocabulary = _TARGET_GRAMMAR if strict else _FILLER | _DOMAINS.keys()
+        unknown = [word for word in remainder.split() if word not in vocabulary and not word.isdigit()][:20]
+        numbered = bool(re.search(r"\b\d+\b", remainder)) and not (words & {"prozent", "percent", "grad", "degree", "degrees", "kelvin"} or "%" in prompt)
         if unknown or numbered:
             pool = [entity for entity in scoped if _matches_domain(entity, domains, words)]
             def score(entity):
@@ -197,7 +260,7 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
         if trace is not None:
             trace["skipped_groups"] = [entity["id"] for entity in candidates if entity.get("group")]
         candidates = [entity for entity in candidates if not entity.get("group")]
-    elif explicit_all or len(candidates) > 1 or (not areas and not named and re.search(r"\b(?:im|in|am|bei|neben)\b", text)):
+    elif explicit_all or (len(candidates) > 1 and not coordinated) or (not areas and not named and re.search(r"\b(?:im|in|am|bei|neben)\b", text)):
         return candidates, {}, [], "clarify"
     elif domains == {"light"} and not areas and not named and hints & {"turn_on", "turn_off"} and not _GENERIC_LIGHT_SWITCH.fullmatch(text):
         return [], {}, [], "clarify"
@@ -206,27 +269,46 @@ def select_context(prompt, catalog, *, trace=None, language="de"):
 
     if not hints and named and _domain(candidates[0]) in {"scene", "script"} and original in specific:
         hints.add("activate")
+    if strict and hints and not hints & {"select_option", "set_value", "climate_hvac_mode"}:
+        remainder = _MEASURE_WORDS.sub(" ", _ALL.sub(" ", action_text))
+        for pattern in _ACTION_PATTERNS.values():
+            remainder = pattern.sub(" ", remainder)
+        residue = set(remainder.split())
+        mentioned = {_DOMAINS[word] for word in residue & _DOMAINS.keys()}
+        if residue - _TARGET_GRAMMAR or mentioned and named and any(_domain(entity) not in mentioned for entity in named):
+            if trace is not None:
+                trace["reason"] = "unrecognized_command_fragment"
+            return candidates, {}, [], "clarify"
     approximate = any(min(group)[0] >= 2 for group in (*area_matches.values(), *matches.values()))
     actions = {entity["id"]: {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and item["id"] in hints and not (approximate and item.get("sensitive"))} for entity in candidates}
-    if not bulk:
+    if trace is not None and strict:
+        trace["rejected_actions"] = [{"id": entity["id"], "action": item["id"], "reason": "unsupported" if item.get("supported") is False else "policy" if not item.get("enabled") else "approximate_sensitive"} for entity in candidates for item in entity["actions"] if item["id"] in hints and item["id"] not in actions[entity["id"]]][:50]
+    if not bulk and not (coordinated and len(candidates) > 1):
         candidate = candidates[0]
         selected = actions[candidate["id"]]
         desired_action = {"off": "turn_off", "on": "turn_on"}.get(candidate["state"])
-        if _domain(candidate) == "light" and not candidate.get("group") and selected.keys() == {desired_action}:
+        if not keep_noops and _domain(candidate) == "light" and not candidate.get("group") and selected.keys() == {desired_action}:
             return candidates, {}, [], "already_set"
         return candidates, selected, [], "matched" if selected else "no_action"
 
-    if domains != {"light"}:
+    if not strict and bulk and domains != {"light"}:
         actions = {target: {action: schema for action, schema in items.items() if action in {"turn_on", "turn_off"}} for target, items in actions.items()}
     available = {action for items in actions.values() for action in items}
     if len(available) != 1:
         return candidates, {}, [], "clarify"
     action = next(iter(available))
     eligible = [entity for entity in candidates if action in actions[entity["id"]]]
+    unsupported = any(item["id"] == action and item.get("supported") is False for entity in candidates for item in entity["actions"])
+    if (coordinated or strict and (action not in {"turn_on", "turn_off"} or unsupported)) and len(eligible) != len(candidates):
+        if trace is not None:
+            trace["reason"] = "incompatible_target_set"
+            trace["rejected"] = [entity["id"] for entity in candidates if entity not in eligible]
+        return candidates, {}, [], "clarify"
     if trace is not None:
         trace["scope"] = [{"id": entity["id"], "name": entity["name"], "area": entity["area"], "state": entity["state"], "status": ("not_allowed" if action not in actions[entity["id"]] else "already_set" if (action, entity["state"]) in {("turn_off", "off"), ("turn_on", "on")} else "target")} for entity in candidates]
-    targets = [entity["id"] for entity in eligible if (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
-    selection = {"id": BULK_TARGET, "name": "Alle passenden Geräte" if domains != {"light"} else "Alle passenden Lampen", "area": candidates[0]["area"] if areas else None, "count": len(targets)}
+    targets = [entity["id"] for entity in eligible if keep_noops or (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
+    target_area = candidates[0]["area"] if areas and next(iter(areas))[0] == "area" else candidates[0].get("floor") if areas else None
+    selection = {"id": BULK_TARGET, "name": "Alle passenden Geräte" if domains != {"light"} else "Alle passenden Lampen", "area": target_area, "count": len(targets)}
     if not targets:
         return [selection | {"state": eligible[0]["state"], "count": len(eligible)}], {}, [], "already_set"
     schema = actions[targets[0]][action]

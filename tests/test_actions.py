@@ -38,7 +38,7 @@ class PolicyTests(unittest.TestCase):
     def setUp(self):
         self.hass = SimpleNamespace(states=States(
             state("light.one"), state("light.two"), state("lock.front"),
-            state("cover.door", device_class="garage"), state("cover.shade", device_class="shade"),
+            state("cover.door", device_class="garage", supported_features=1), state("cover.shade", device_class="shade", supported_features=1),
             state("group.room", entity_id=["light.one", "light.two"]),
             state("scene.opaque"), state("script.test"),
             state("scene.native", entity_id=["light.one", "lock.front"]),

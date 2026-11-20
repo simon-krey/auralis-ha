@@ -16,6 +16,10 @@ Einfache Ein/Aus-Lichtbefehle bereitet Auralis vollständig vor. Bei „Kannst d
 
 Ein/Aus-Sammelbefehle wie „Schalte alle Lampen aus“ erfassen auch Geräte ohne Raum. Eindeutige Sammelbefehle funktionieren ebenso für Schalter, Ventilatoren und Luftbefeuchter. Auralis überspringt Gruppen, um Geräte nicht doppelt zu schalten. Im Verlauf stehen die passende Geräteauswahl und die tatsächlich zu ändernden Ziele getrennt.
 
+**Action Resolver 2.0** prüft ausdrücklich genannte Ziele als vollständige Liste: Bei „Schalte die Leselampe und die Sofalampe aus“ wird nichts geschaltet, wenn eines der Ziele unklar, technisch ungeeignet oder nicht freigegeben ist. Unterstützt werden auch „Stelle alle Lampen im Wohnzimmer auf 40 Prozent“, eindeutige Ausnahmen und mehrere Aktionen in einer Anfrage. Ein parametrisierter Sammelbefehl wird nur angeboten, wenn alle Ziele den gewünschten Wert unterstützen und die Aktion erlauben. Bei Ein/Aus-Sammelbefehlen werden bekannte, per Richtlinie gesperrte Ziele übersprungen und als solche gemeldet.
+
+In derselben nativen Assist-Konversation kann „Mach sie blau“ auf ein zuvor bestätigtes Ziel verweisen. Diese Referenzen verfallen nach fünf Minuten und werden nicht zwischen Benutzern oder Satelliten geteilt. Für bedingte Befehle, uneindeutige Verweise und relative Angaben ohne festgelegten Schritt fragt Auralis nach oder führt nichts aus. Details zur [Architektur und zum Offline-Benchmark](docs/action-resolver-v2-results.md).
+
 <!-- ha-marketplace:exclude-start -->
 ## Installation
 

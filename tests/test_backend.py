@@ -10,12 +10,10 @@ ROOT = pathlib.Path(__file__).parents[1] / "custom_components" / "auralis"
 package = types.ModuleType("bridge_test")
 package.__path__ = [str(ROOT)]
 sys.modules["bridge_test"] = package
-for name in ("aiohttp", "homeassistant", "homeassistant.helpers", "homeassistant.helpers.aiohttp_client", "homeassistant.helpers.storage", "bridge_test.actions"):
+for name in ("aiohttp", "homeassistant", "homeassistant.helpers", "homeassistant.helpers.aiohttp_client", "homeassistant.helpers.storage"):
     sys.modules.setdefault(name, types.ModuleType(name))
 sys.modules["homeassistant.helpers.aiohttp_client"].async_get_clientsession = lambda hass: None
 sys.modules["homeassistant.helpers.storage"].Store = object
-sys.modules["bridge_test.actions"].ActionPolicy = object
-sys.modules["bridge_test.actions"].MAX_ACTION_TARGETS = 100
 spec = importlib.util.spec_from_file_location("bridge_test.backend", ROOT / "backend.py")
 backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)
@@ -35,7 +33,10 @@ class Policy:
     def catalog(self, user=None, *, for_retrieval=False):
         return self.entities
 
-    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None):
+    def preflight(self, action, entity_ids, parameters, context, *, user=None, expected_leaves=None):
+        return {"executed": [], "planned": expected_leaves, "skipped": [], "errors": []}
+
+    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None, expected_leaves=None):
         assert dry_run and user == "user" and context == "context"
         self.calls.append((action, entity_ids, parameters))
         return {"executed": [], "planned": entity_ids, "skipped": [], "errors": []}
@@ -67,6 +68,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         obj.store, obj.history_store = Store(), Store()
         import asyncio
         obj.lock = asyncio.Lock()
+        if hasattr(backend, "ConversationMemory"):
+            obj.memory = backend.ConversationMemory()
         obj.policy = lambda: Policy()
         return obj
 
@@ -303,7 +306,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([len(call[1]) for call in policy.calls], [100, 1])
         self.assertEqual(result["tools"][0]["result"]["planned"], targets)
         self.assertEqual(len(requests), 1)
-        self.assertEqual(result["answer"], "101 Lampen würden ausgeschaltet.")
+        self.assertEqual(result["answer"], "101 Lampen würden ausgeschaltet. Nicht alle Ziele waren schaltbar.")
         self.assertEqual(result["diagnostics"]["confirmation"], {"action": "turn_off", "state": "approved"})
         self.assertEqual(result["diagnostics"]["selection"]["resolved_targets"], targets)
         self.assertEqual(result["diagnostics"]["selection"]["entities"][0]["id"], backend.BULK_TARGET)
