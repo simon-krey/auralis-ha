@@ -251,6 +251,7 @@ class AuralisPanel extends HTMLElement {
       target_type_mismatch: 'Gerätename und Gerätetyp passen nicht zusammen', incomplete_compound_plan: 'Nicht alle Teilschritte sind ausführbar',
       unresolved_reference: 'Bezugsgerät nicht gefunden', ambiguous_reference: 'Mehrere mögliche Bezugsgeräte',
       unrecognized_command_fragment: 'Teil des Befehls nicht erkannt', missing_ambiguous_or_unsupported_parameters: 'Parameter fehlen, sind mehrdeutig oder werden vom Gerät nicht unterstützt',
+      unsupported_action_parameters: 'Gerät unterstützt den angeforderten Parametertyp nicht',
       incomplete_bounded_choices: 'Nicht alle Alternativen wurden sicher aufgelöst', subjective_value_not_configured: 'Keine eindeutige Einstellung für diese Beschreibung',
       live_value_unsupported_or_ambiguous: 'Kein gültiger Gerätewert für die relative Änderung',
       mixed_power_and_parameter_scope: 'Schalten und Einstellen bitte als getrennte Teilschritte angeben',
@@ -289,11 +290,31 @@ class AuralisPanel extends HTMLElement {
     const state = ({ pending: 'keine Antwort erhalten', missing: 'keine Bestätigung erhalten', approved: 'bestätigt', rejected: 'abgelehnt', invalid: 'ungültige Bestätigung' })[confirmation.state];
     return state ? `Vorbereitete Aktion: ${confirmation.action} · ${state}` : '';
   }
+  actionOutcomeText(outcome) {
+    return ({
+      no_executable_action: 'Keine ausführbare Aktion erkannt', already_set: 'Zustand bereits erreicht',
+      capability_or_policy_rejected: 'Aktion nicht unterstützt oder nicht freigegeben',
+      tool_generation_failed: 'Werkzeuge konnten nicht erzeugt werden', required_tools_missing: 'Erforderliche Werkzeuge fehlen in der HTTP-Anfrage',
+      context_budget_exceeded: 'Kontextbudget überschritten; Anfrage nicht gesendet',
+      provider_rejected: 'Anbieter hat die Anfrage abgelehnt', provider_failed: 'API-Anfrage fehlgeschlagen',
+      model_invalid_response: 'Ungültige Anbieterantwort', model_no_tool_calls: 'Modellantwort ohne Werkzeugaufruf',
+      model_invalid_tool_calls: 'Ungültige oder unvollständige Werkzeugaufrufe', model_output_truncated: 'Ausgabe am Modelllimit abgeschnitten',
+      model_rejected_plan: 'Modell hat den Plan abgelehnt', preflight_rejected: 'Ausführungsprüfung fehlgeschlagen',
+      dry_run_validated: 'Vollständiger Plan im Trockenlauf geprüft', dry_run_partial: 'Trockenlauf meldet übersprungene oder fehlgeschlagene Aktionen',
+      executed: 'Aktion ausgeführt', partial_failure: 'Teilweise ausgeführt', execution_failed: 'Keine Aktion ausgeführt',
+    })[outcome] || outcome;
+  }
+  toolDeliveryText(delivery) {
+    return ({sent: 'Werkzeuge gesendet', not_required: 'keine Werkzeuge erforderlich', provider_rejected: 'Anfrage mit Werkzeugen abgelehnt', unconfirmed: 'Zustellung nicht bestätigt'})[delivery] || delivery;
+  }
   testDiagnostics(details) {
     if (!details) return '';
     const lines = [];
     if (Number.isFinite(details.duration_ms)) lines.push(`Verarbeitungszeit: ${this.duration(details.duration_ms)}`);
-    if (details.selection) lines.push(`An das LLM übergebene Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
+    if (details.selection) lines.push(`Lokal vorbereitete Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
+    if (details.action_outcome) lines.push(this.actionOutcomeText(details.action_outcome));
+    const request = details.requests?.[0];
+    if (request?.tool_delivery) lines.push(`${this.toolDeliveryText(request.tool_delivery)}${request.tool_names?.length ? `: ${request.tool_names.join(', ')}` : ''}`);
     if (details.context_budget?.fallback) lines.push('Vollkatalog zu groß: lokale Auswahl verwendet.');
     lines.push(this.confirmationText(details.confirmation));
     return lines.filter(Boolean).map(line => `\n${line}`).join('');
@@ -308,7 +329,7 @@ class AuralisPanel extends HTMLElement {
     }
     if (selection) {
       const summary = document.createElement('p');
-      summary.textContent = `An das LLM übergebene Aktionen: ${this.offeredActions(selection)}${this.selectionText(selection) ? ` · ${this.selectionText(selection)}` : ''}`;
+      summary.textContent = `Lokal vorbereitete Aktionen: ${this.offeredActions(selection)}${this.selectionText(selection) ? ` · ${this.selectionText(selection)}` : ''}`;
       article.append(summary);
     }
     const confirmation = this.confirmationText(details.confirmation);
@@ -329,6 +350,7 @@ class AuralisPanel extends HTMLElement {
     const timeline = [];
     if (Number.isFinite(details.selection_ms)) timeline.push({ start: details.selection_started_ms, sequence: 0, title: 'Lokale Auswahl', value: this.duration(details.selection_ms) });
     if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
+    if (details.action_outcome) values.push(['Aktionsstatus', this.actionOutcomeText(details.action_outcome)]);
     if (selection) {
       values.push(['Modus', selection.mode], ['Vollständiger passender Umfang', selection.matched_scope], ['Lokale Auswahl', selection.entities], ['Katalog im Modellkontext', selection.catalog_entities], ['Aktive Aktionen', selection.active_actions ?? selection.action_parameters]);
       values.push(['Resolver-Modus', selection.resolution_mode], ['Werkzeugstrategie', selection.strategy], ['Aktionsplan', selection.plan], ['Aktionsalternativen', selection.candidates], ['Werkzeugdefinitionen', selection.offered_tools]);
@@ -341,9 +363,12 @@ class AuralisPanel extends HTMLElement {
     if (details.local_timings_ms) values.push(['Lokale Phasen (ms)', details.local_timings_ms]);
     for (const [index, round] of (details.requests || []).entries()) {
       const parts = [this.duration(round.duration_ms)];
-      if (typeof round.offered_tools === 'boolean') parts.push(round.offered_tools ? 'Werkzeug angeboten' : 'kein Werkzeug angeboten');
-      if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe angefordert`);
-      if (round.selected_tools?.length) parts.push(round.selected_tools.join(', '));
+      if (round.tool_delivery) {
+        parts.push(this.toolDeliveryText(round.tool_delivery));
+      } else if (typeof round.offered_tools === 'boolean') parts.push(round.offered_tools ? 'Werkzeug angeboten' : 'kein Werkzeug angeboten');
+      if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe zurückgegeben`);
+      if (round.finish_reason) parts.push(`Finish: ${round.finish_reason}`);
+      if (round.http_status) parts.push(`HTTP ${round.http_status}`);
       if (round.failed) parts.push('fehlgeschlagen');
       if (round.usage) parts.push(`${[Number.isFinite(round.usage.prompt_tokens) && `${round.usage.prompt_tokens} Eingabe`, Number.isFinite(round.usage.completion_tokens) && `${round.usage.completion_tokens} Ausgabe`, Number.isFinite(round.usage.total_tokens) && `${round.usage.total_tokens} gesamt`].filter(Boolean).join(' / ')} Tokens`);
       timeline.push({ start: round.started_ms, sequence: round.sequence, title: `API-Anfrage ${index + 1}`, value: parts.filter(Boolean).join(' · '), round });
@@ -366,6 +391,9 @@ class AuralisPanel extends HTMLElement {
       if (step.round.request) {
         const { method, endpoint, body } = step.round.request;
         this.appendHistoryField(request, 'HTTP-Anfrage', [method, endpoint || 'kein gültiger Endpunkt'].join(' '));
+        if (Number.isFinite(step.round.provider_ms)) this.appendHistoryField(request, 'Anbieterzeit', this.duration(step.round.provider_ms));
+        if (Number.isFinite(step.round.tool_count)) this.appendHistoryField(request, 'Werkzeuge im HTTP-Body', `${step.round.tool_count}${step.round.tool_names?.length ? ` · ${step.round.tool_names.join(', ')}` : ''}`);
+        if (step.round.selected_tools?.length) this.appendHistoryField(request, 'Zurückgegebene Werkzeuge', step.round.selected_tools);
         this.appendHistoryField(request, typeof step.round.offered_tools === 'boolean' ? 'Vollständiger JSON-Body' : 'Multipart-Felder (Audio separat)', body);
       }
       if ('reasoning' in step.round) this.appendHistoryField(request, 'Modell-Thinking', step.round.reasoning || (step.round.failed ? 'Keine erfolgreiche API-Antwort.' : 'Der Anbieter hat kein Thinking geliefert.'));

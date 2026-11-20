@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from collections import defaultdict
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 import inspect
 import json
@@ -12,7 +13,7 @@ import statistics
 import sys
 import time
 from types import SimpleNamespace
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from unittest.mock import patch
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class Case:
     restricted: bool = False
     alternative: tuple = ()
     expected_skips: tuple = ()
+    delivery: bool = False
 
 
 def corpus(suite, distractors):
@@ -100,7 +102,17 @@ def corpus(suite, distractors):
     group = add("light.living_group", "Wohnzimmergruppe", "Wohnzimmer", entity_id=[reading, sofa])
     lock = add("lock.front", "Haustürschloss", "Flur")
     cases.extend((
-        Case("Schalte die Hue Go Lampe an und ändere ihre Farbe auf lila", step(first, "turn_on") + step(first, rgb_color=[128, 0, 128])),
+        Case("Schalte die Hue Go Lampe an", step(first, "turn_on"), delivery=True),
+        Case("Mach die Sofa lampe aus", step(sofa, "turn_off")),
+        Case("Ändere die Farbe der Hue Go Lampe auf lila", step(first, rgb_color=[128, 0, 128]), delivery=True),
+        Case("Schalte die Hue Go Lampe an und dimme die Sofalampe auf 40 Prozent", step(first, "turn_on") + step(sofa, brightness_pct=40)),
+        Case("Dimme alle Lampen im Wohnzimmer auf 40 Prozent", step([reading, sofa], brightness_pct=40), delivery=True),
+        Case("Stelle die heligkeit der Sofa lampe auf 45 Prozent", step(sofa, brightness_pct=45)),
+        Case("Schalt die Hue Go Lampe an und stell sie auf blau", step(first, "turn_on") + step(first, rgb_color=[0, 0, 255])),
+        Case("Mach die Hue Goo Lampe an", clarify=True),
+        Case("Mach den Fernseer leiser", clarify=True),
+        Case("Mach die Sofa Lampe nicht aus"),
+        Case("Schalte die Hue Go Lampe an und ändere ihre Farbe auf lila", step(first, "turn_on") + step(first, rgb_color=[128, 0, 128]), delivery=True),
         Case("Mach die Hue Go an und stell sie auf blau", step(first, "turn_on") + step(first, rgb_color=[0, 0, 255])),
         Case("Schalte Hue Go Identify ein", clarify=True),
         Case("Setze Hue Go Effect Speed auf 50 Prozent", clarify=True),
@@ -134,7 +146,7 @@ def corpus(suite, distractors):
         Case("Ist das Paneel im Keller an?"),
         Case("Mach die Leselampe aus auf die Hälfte", clarify=True),
         Case("Mach die Hue Go Lampe gemütlicher", clarify=True),
-        Case("Wahlweise stell die Hue Go Lampe auf 35 Prozent oder schalte die Hue Go Lampe aus", step(first, brightness_pct=35), alternative=step(first, "turn_off")),
+        Case("Wahlweise stell die Hue Go Lampe auf 35 Prozent oder schalte die Hue Go Lampe aus", step(first, brightness_pct=35), alternative=step(first, "turn_off"), delivery=True),
         Case("Wahlweise stell die Hue Go Lampe auf 35 Prozent oder schalte die Sofalampe aus", clarify=True),
         Case("Turn the Hue Go lamp on and change its color to purple", step(first, "turn_on") + step(first, rgb_color=[128, 0, 128]), "en"),
         Case("Set the Hue Go lamp to half", step(first, brightness_pct=50), "en"),
@@ -156,29 +168,6 @@ def corpus(suite, distractors):
                                               aliases=("Arbeitszimmer",) if fixtures[eid].attributes["area"] == "Büro" else ())
     policy._location_metadata = lambda area, entry: ("Hue Go" if entry.device_id else None, floor if area.id in {"Büro", "Wohnzimmer"} else None)
     return tuple(cases), policy
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-def model_provider(backend, args):
-    url = backend.llm_route(backend.llm_base_url(args.endpoint), "chat/completions")
-    opener = build_opener(NoRedirect())
-    headers = {"Content-Type": "application/json"}
-    if token := os.environ.get("AURALIS_BENCH_TOKEN"):
-        headers["Authorization"] = f"Bearer {token}"
-
-    def request(payload):
-        put = Request(url, data=json.dumps(payload).encode(), method="POST", headers=headers)
-        with opener.open(put, timeout=args.timeout) as response:
-            data = response.read(1024 * 1024 + 1)
-            if len(data) > 1024 * 1024:
-                raise ValueError("Provider response exceeded 1 MiB")
-            return json.loads(data)
-
-    return request
 
 
 def approved(payload):
@@ -212,26 +201,45 @@ def metric(expected, actual):
 def distribution(samples):
     if not samples:
         return None
-    return {"p50": round(statistics.median(samples), 4), "p95": round(statistics.quantiles(samples, n=20)[18], 4) if len(samples) >= 2 else None}
+    return {"p50": round(statistics.median(samples), 4), "p95": round(statistics.quantiles(samples, n=20, method="inclusive")[18], 4) if len(samples) >= 2 else None}
 
 
 async def run(args):
-    from test_backend import BackendTests, backend
+    async with AsyncExitStack() as stack:
+        if args.endpoint:
+            from aiohttp import ClientSession
+            session = await stack.enter_async_context(ClientSession())
+        from test_backend import BackendTests, backend
+        if args.endpoint:
+            stack.enter_context(patch.object(backend, "async_get_clientsession", return_value=session))
+        await evaluate(args, BackendTests().bridge(), backend)
 
+
+async def evaluate(args, bridge, backend):
     cases, policy = corpus(args.suite, args.distractors)
-    if args.endpoint:
+    if args.delivery_cases:
+        cases = tuple(case for case in cases if case.delivery)[:args.model_cases]
+    elif args.endpoint:
         cases = tuple(case for case in cases if not case.reference and (case.plan or case.alternative))[-args.model_cases:]
-    bridge = BackendTests().bridge()
     bridge.policy = lambda: policy
-    bridge.settings.update(llm_plan_approval=args.strategy, history_enabled=False, llm_model=args.model or "offline-test")
-    live = model_provider(backend, args) if args.endpoint else None
+    bridge.settings.update(llm_plan_approval=args.strategy, history_enabled=False, llm_model=args.model or "offline-test",
+                           llm_reasoning=args.reasoning, llm_full_context=args.full_context)
+    live = bool(args.endpoint)
+    if live:
+        bridge.settings.update(llm_url=args.endpoint, llm_token=os.environ.get("AURALIS_BENCH_TOKEN", ""))
+
+    async def provider(kind, *, payload):
+        return approved(payload)
+
+    if not live:
+        bridge.request = provider
     totals = defaultdict(int)
+    outcomes = defaultdict(int)
     stages = defaultdict(list)
     action_expected, action_offered = set(), set()
     resolver_ms, decision_ms, rounds, payload_bytes, estimates, provider_ms = [], [], [], [], [], []
     usage = defaultdict(list)
     misses = []
-    sent = []
     direct = inspect.signature(backend.resolve).parameters
     for index, case in enumerate(cases):
         user = SimpleNamespace(id="limited", is_admin=False, is_active=True,
@@ -259,20 +267,12 @@ async def run(args):
         if case.reference:
             continue
         details = {}
-        sent.clear()
-
-        async def provider(kind, *, payload):
-            if not sent:
-                payload_bytes.append(len(json.dumps(payload, ensure_ascii=False).encode()))
-            sent.append(bool(payload.get("tools")))
-            return await asyncio.to_thread(live, payload) if live else approved(payload)
-
-        bridge.request = provider
         totals["pipeline_cases"] += 1
         totals["pipeline_action_cases"] += bool(case.plan)
         started = time.perf_counter()
         try:
-            result = await bridge.chat(case.text, case.language, context, user, dry_run=True, details=details)
+            async with asyncio.timeout(args.timeout):
+                result = await bridge.chat(case.text, case.language, context, user, dry_run=True, details=details)
             rows = [row for row in result["tools"] if row["result"]["planned"]]
             applied = signature(rows)
             accepted = [case.plan] + ([case.alternative] if case.alternative else [])
@@ -287,27 +287,40 @@ async def run(args):
                 decision_ms.append((time.perf_counter() - started) * 1000)
             else:
                 misses.append(case.text)
-        except backend.AuralisError:
+        except (backend.AuralisError, TimeoutError):
             totals["provider_or_validation_errors"] += 1
             misses.append(case.text)
-        totals["first_requests_with_tools"] += bool(sent and sent[0])
-        totals["first_requests_with_returned_calls"] += bool(details["requests"] and details["requests"][0].get("tool_calls"))
+        requests = details.get("requests", [])
+        request = requests[0] if requests else {}
+        outcome = details.get("action_outcome", "no_diagnostic")
+        outcomes[outcome] += 1
+        if body := request.get("request", {}).get("body"):
+            payload_bytes.append(len(json.dumps(body).encode()))
+        totals["first_requests_with_tools"] += bool(request.get("offered_tools"))
+        totals["first_requests_with_returned_calls"] += bool(request.get("tool_calls"))
+        if case.plan:
+            totals["confirmed_tool_deliveries"] += request.get("tool_delivery", "sent" if request.get("offered_tools") and not request.get("failed") else "unknown") == "sent"
+            totals["valid_model_decisions"] += bool(details.get("selection", {}).get("parameters_validated") or details.get("confirmation", {}).get("state") == "rejected")
         if measured := details.get("context_budget", {}).get("rounds"):
             estimates.append(measured[0]["estimate"])
         for name, duration in details.get("local_timings_ms", {}).items():
             stages[name].append(duration)
-        rounds.append(len(details["requests"]))
-        for request in details["requests"]:
-            provider_ms.append(request["duration_ms"])
+        rounds.append(len(requests))
+        for request in requests:
+            provider_ms.append(request.get("provider_ms", request["duration_ms"]))
             for key, count in request.get("usage", {}).items():
                 usage[key].append(count)
     assert not policy.hass.services.calls
-    print(json.dumps({"suite": args.suite, "strategy": args.strategy, "cases": len(cases), "states": len(policy.hass.states.items),
+    expected_count = max(totals["pipeline_action_cases"], 1)
+    print(json.dumps({"suite": args.suite, "strategy": args.strategy, "reasoning": args.reasoning, "cases": len(cases), "states": len(policy.hass.states.items),
                       "german_cases": sum(case.language == "de" for case in cases), "live_provider": bool(live),
+                      "action_outcomes": outcomes, "tool_delivery_rate": totals["confirmed_tool_deliveries"] / expected_count,
+                      "valid_tool_call_rate": totals["valid_model_decisions"] / expected_count,
+                      "complete_action_plan_rate": totals["complete_validated_actions"] / expected_count,
                       **totals, "entity": metric({pair[:2] for pair in action_expected}, {pair[:2] for pair in action_offered}),
                       "action": metric(action_expected, action_offered), "resolver_ms": distribution(resolver_ms),
                       "local_stage_ms": {key: distribution(value) for key, value in stages.items()},
-                      "complete_decision_ms": distribution(decision_ms), "first_request_bytes_mean": round(statistics.mean(payload_bytes), 2),
+                      "complete_decision_ms": distribution(decision_ms), "first_request_bytes_mean": round(statistics.mean(payload_bytes), 2) if payload_bytes else None,
                       "first_request_budget_estimate_mean": round(statistics.mean(estimates), 2) if estimates else None,
                       "model_rounds_mean": statistics.mean(rounds) if live else None, "real_provider_ms": distribution(provider_ms) if live else None,
                       "first_request_ms_model_temperature_uncontrolled": provider_ms[0] if live and provider_ms else None,
@@ -320,6 +333,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["dev", "held-out"], default="held-out")
     parser.add_argument("--strategy", choices=["multi", "single"], default="multi")
+    parser.add_argument("--reasoning", choices=["default", "on", "off"], default="default")
+    parser.add_argument("--delivery-cases", action="store_true", help="Use the paired German tool-delivery subset")
+    parser.add_argument("--full-context", action="store_true")
     parser.add_argument("--distractors", type=int, default=0)
     parser.add_argument("--target", type=Path, help="A baseline checkout or snapshot with tests and custom_components")
     parser.add_argument("--endpoint")

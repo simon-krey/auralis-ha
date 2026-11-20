@@ -34,6 +34,16 @@ class AuralisError(ValueError):
     """A diagnostic that can be shown to an administrator."""
 
 
+class ProviderRejected(AuralisError):
+    def __init__(self, status, detail):
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+
+
+class InvalidProviderResponse(AuralisError):
+    """An HTTP success response that cannot be parsed."""
+
+
 @dataclass(frozen=True)
 class ExecutableStep:
     action: str
@@ -56,19 +66,24 @@ class ExecutableStep:
         return {key: list(value) if isinstance(value, tuple) else value for key, value in self.values}
 
 
-def _tool_arguments(call):
-    def unique(pairs):
-        result = dict(pairs)
-        if len(result) != len(pairs):
-            raise ValueError("duplicate JSON keys")
-        return result
+def _unique_json_keys(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate JSON keys")
+    return result
 
+
+def _reject_json_constant(value):
+    raise ValueError("invalid JSON constant")
+
+
+def _tool_arguments(call):
     try:
         function = call["function"]
         arguments = function["arguments"]
         if not isinstance(arguments, str) or len(arguments) > MAX_TEXT or ("type" in call and call["type"] != "function"):
             raise ValueError
-        parsed = json.loads(arguments, object_pairs_hook=unique)
+        parsed = json.loads(arguments, object_pairs_hook=_unique_json_keys, parse_constant=_reject_json_constant)
         if not isinstance(parsed, dict) or not isinstance(function["name"], str):
             raise ValueError
         return function["name"], parsed
@@ -102,6 +117,15 @@ def _decision_tool(name, description, argument, schema):
     return {"type": "function", "function": {"name": name, "description": description, "parameters": {
         "type": "object", "properties": {argument: schema}, "required": [argument], "additionalProperties": False,
     }}}
+
+
+def _check_tools(tools, expected):
+    return (isinstance(tools, list) and len(tools) == len(expected) == len(set(expected))
+            and all(isinstance(tool, dict) and tool.get("type") == "function"
+                    and isinstance(tool.get("function"), dict) and tool["function"].get("name") == name
+                    and isinstance(schema := tool["function"].get("parameters"), dict) and schema.get("type") == "object"
+                    and isinstance(schema.get("properties"), dict) and schema.get("required") == list(schema["properties"])
+                    and schema.get("additionalProperties") is False for tool, name in zip(tools, expected)))
 
 
 def _failed(result):
@@ -308,8 +332,8 @@ class Bridge:
                     raw.extend(chunk)
                     if len(raw) > MAX_RESPONSE:
                         if response.status >= 300:
-                            raise AuralisError(f"HTTP {response.status}: Fehlerantwort zu groß.")
-                        raise AuralisError("Antwort des Anbieters zu groß.")
+                            raise ProviderRejected(response.status, "Fehlerantwort zu groß.")
+                        raise InvalidProviderResponse("Antwort des Anbieters zu groß.")
                 if not 200 <= response.status < 300:
                     message = ""
                     try:
@@ -323,8 +347,14 @@ class Bridge:
                         if response.content_type == "text/plain":
                             message = raw.decode("utf-8", errors="replace").strip()
                     detail = self.redact(message, url, token)
-                    raise AuralisError(f"HTTP {response.status}: {detail or self.redact(response.reason or 'Anbieteranfrage fehlgeschlagen', url, token)}")
-                return json.loads(raw)
+                    raise ProviderRejected(response.status, detail or self.redact(response.reason or "Anbieteranfrage fehlgeschlagen", url, token))
+                try:
+                    if form is None and method == "POST":
+                        return json.loads(raw, object_pairs_hook=_unique_json_keys, parse_constant=_reject_json_constant)
+                    return json.loads(raw)
+                except (ValueError, RecursionError) as error:
+                    detail = diagnostic(error) if isinstance(error, json.JSONDecodeError) else "Ungültiges JSON in der Anbieterantwort."
+                    raise InvalidProviderResponse(detail) from None
         except TimeoutError:
             raise AuralisError("Zeitüberschreitung beim API-Anbieter.") from None
         except aiohttp.ClientError as error:
@@ -352,26 +382,43 @@ class Bridge:
         except Exception as error:
             raise AuralisError(diagnostic(error)) from None
 
-    async def timed_request(self, kind, details, origin, *, sequence=1, form_fields=None, **kwargs):
+    async def timed_request(self, kind, details, origin, *, sequence=1, form_fields=None, expected_tools=(), **kwargs):
         started = time.perf_counter()
         request = {"started_ms": round((started - origin) * 1000), "sequence": sequence}
-        request["request"] = self.request_snapshot(kind, kwargs.get("payload", form_fields))
+        body = kwargs.get("payload", form_fields)
         if kind == "llm":
-            request["offered_tools"] = bool(kwargs["payload"].get("tools"))
+            offered = body.get("tools", [])
+            if not _check_tools(offered, expected_tools):
+                details["action_outcome"] = "required_tools_missing"
+                raise AuralisError("Die HTTP-Anfrage enthält nicht die erwarteten Werkzeuge. Nichts wurde geändert.")
+            request.update(offered_tools=bool(offered), tool_names=list(expected_tools), tool_count=len(offered),
+                           tool_delivery="pending" if offered else "not_required")
             request["reasoning"] = None
+        request["request"] = self.request_snapshot(kind, body)
         details["requests"].append(request)
+        http_started = time.perf_counter()
         try:
             data = await self.request(kind, **kwargs)
+            if request.get("tool_count"):
+                request["tool_delivery"] = "sent"
             usage = data.get("usage") if isinstance(data, dict) else None
             if isinstance(usage, dict):
                 counts = {key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens") if type(usage.get(key)) is int and 0 <= usage[key] < 2**31}
                 if counts:
                     request["usage"] = counts
             return data
-        except Exception:
+        except Exception as error:
             request["failed"] = True
+            if isinstance(error, ProviderRejected):
+                request["http_status"] = error.status
+            if kind == "llm":
+                outcome = "provider_rejected" if isinstance(error, ProviderRejected) else "model_invalid_response" if isinstance(error, InvalidProviderResponse) else "provider_failed"
+                details["action_outcome"] = outcome
+                if request["tool_count"]:
+                    request["tool_delivery"] = {"provider_rejected": "provider_rejected", "model_invalid_response": "sent"}.get(outcome, "unconfirmed")
             raise
         finally:
+            request["provider_ms"] = (time.perf_counter() - http_started) * 1000
             request["duration_ms"] = elapsed_ms(started)
 
     async def transcribe(self, audio, mime, language, test=False, *, details=None):
@@ -408,7 +455,7 @@ class Bridge:
     async def chat(self, prompt, language, context, user, dry_run=False, *, details=None, memory_key=None, voice_origin=None):
         started = time.perf_counter()
         details = {} if details is None else details
-        details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[])
+        details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[], action_outcome="no_executable_action")
         results = []
         memory_key = None if dry_run else memory_key
         history_input = self.redact(prompt[:MAX_TEXT], url=self.settings["llm_url"], limit=None) if isinstance(prompt, str) else ""
@@ -487,6 +534,8 @@ class Bridge:
             details["selection_started_ms"] = round((selection_started - started) * 1000)
             details["selection"] = {"status": selection, "mode": "all" if self.settings["llm_full_context"] else "filtered", "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets, "matched_scope": matches.pop("scope", []), "plan": [step.diagnostic() for step in steps]}
             details["selection"].update(resolution_mode=mode.value, candidates=[choice.diagnostic() for choice in resolved.choices])
+            if selection == "no_action" or matches.get("rejected_actions") or any(clause.get("status") == "no_action" for clause in matches.get("clauses", [])):
+                details["action_outcome"] = "capability_or_policy_rejected"
             if memory_key and not pending and len(prompt) <= 512 and mode is ResolutionMode.CLARIFICATION:
                 alternatives = target_alternatives(prompt, catalog, language, resolved)
                 if alternatives:
@@ -498,6 +547,7 @@ class Bridge:
                     details["selection"]["clarification_choices"] = inventory
                     return await finish(f"First: {labels[0]}, or second: {labels[1]}?" if english else f"Erste: {labels[0]}, oder zweite: {labels[1]}?")
             if selection == "already_set":
+                details["action_outcome"] = "already_set"
                 target = inventory[0]
                 scope = details["selection"]["matched_scope"]
                 missed = any(item["status"] == "not_allowed" for item in scope)
@@ -531,9 +581,50 @@ class Bridge:
             if prepared or single_plan:
                 details["confirmation"] = {"action": prepared or "approve_plan", "state": "pending"}
             unconfirmed = ("I couldn't confirm the action plan." if english else "Ich konnte den Aktionsplan nicht bestätigen.") if single_plan else ("I couldn't confirm that light command." if english else "Ich konnte den Lichtbefehl nicht bestätigen.")
-            tools_started = time.perf_counter()
+            schema_started = time.perf_counter()
+            resolution_outcome = details["action_outcome"]
+            details["action_outcome"] = "tool_generation_failed"
             plan_tools = _plan_tools(steps) if adaptive else {}
+            if prepared:
+                tools = [_decision_tool("confirm_action", "Validate the fixed light action against the user's request. Approve only if the action and target match.", "approved", {"type": "boolean"})]
+                expected_tools = ("confirm_action",)
+            elif single_plan:
+                tools = [_decision_tool("approve_plan", "Approve or reject the complete fixed plan.", "approved", {"type": "boolean"})]
+                expected_tools = ("approve_plan",)
+            elif bounded:
+                tools = [_decision_tool("choose_action", "Choose one locally bound action, or ask for clarification without calling a tool.", "choice", {"type": "string", "enum": list(bounded)})]
+                expected_tools = ("choose_action",)
+            elif adaptive:
+                tools, expected_tools = list(plan_tools.values()), tuple(plan_tools)
+            elif enabled and steps:
+                action_spec = {"type": "string", "enum": sorted(enabled)}
+                target_spec = {"type": "string", "enum": allowed_ids}
+                arguments = {"action": action_spec, "entity_ids": {"type": "array", "items": target_spec, "minItems": 1, "maxItems": 1},
+                             "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
+                tools = [{"type": "function", "function": {"name": "run_action", "description": "Approve the fixed device action.",
+                          "parameters": {"type": "object", "properties": arguments, "required": list(arguments), "additionalProperties": False}}}]
+                expected_tools = ("run_action",)
+            else:
+                tools, expected_tools = [], ()
+            required_count = len(steps) if adaptive else 1 if mode in (ResolutionMode.DETERMINISTIC, ResolutionMode.BOUNDED) else 0
+            if (bool(steps) != (mode is ResolutionMode.DETERMINISTIC) or bool(bounded) != (mode is ResolutionMode.BOUNDED)
+                    or len(expected_tools) != required_count or not _check_tools(tools, expected_tools)
+                    or expected_tools == ("run_action",) and (len(steps) != 1 or len(allowed_ids) != 1 or len(enabled) != 1 or steps[0].parameters)):
+                raise AuralisError("Für die lokale Entscheidung konnten nicht die erwarteten Werkzeuge erstellt werden. Nichts wurde geändert.")
+            timings["schema_generation_ms"] = (time.perf_counter() - schema_started) * 1000
+            details["action_outcome"] = resolution_outcome
+            details["selection"]["active_actions"] = enabled
+            details["selection"]["offered_actions"] = sorted({step.action for step in (*steps, *bounded.values())})
+            details["selection"]["offered_tools"] = tools
+            details["selection"]["strategy"] = "single_plan" if single_plan else "bounded_choice" if bounded else "multi_approval" if adaptive else "legacy" if tools else "none"
+
+            def model_step(step):
+                targets = step.targets
+                return {"action": step.action, "parameters": step.parameters, "count": len(targets),
+                        **({"targets": targets} if len(targets) <= 8 else {"scope": "complete locally resolved scope"})}
+
             def build_request(full_mode):
+                context_started = time.perf_counter()
                 model_context = {"entities": catalog_inventory if full_mode else inventory}
                 if full_mode:
                     profiles, schemas, rows = [], [], []
@@ -553,29 +644,18 @@ class Bridge:
                     model_context["prepared_action"] = prepared
                 elif adaptive:
                     model_context["plan"] = [
-                        {"tool": name, "action": step.action, "parameters": step.parameters, "count": len(step.targets),
-                         **({"targets": step.targets} if len(step.targets) <= 8 else {})}
+                        {"tool": name, **model_step(step)}
                         for name, step in zip(plan_tools, steps)
                     ]
                 else:
                     model_context["action_parameters"] = enabled
                 inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
-                tools = []
-                if prepared:
-                    tools = [{"type":"function", "function":{"name":"confirm_action", "description":"Validate the fixed light action against the user's request. Approve only if the action and target match.", "parameters":{"type":"object", "properties":{"approved":{"type":"boolean"}}, "required":["approved"], "additionalProperties":False}}}]
-                elif single_plan:
-                    tools = [_decision_tool("approve_plan", "Approve or reject the complete fixed plan.", "approved", {"type": "boolean"})]
-                elif bounded:
-                    tools = [_decision_tool("choose_action", "Choose one locally bound action, or ask for clarification without calling a tool.", "choice", {"type": "string", "enum": list(bounded)})]
-                elif adaptive:
-                    tools = list(plan_tools.values())
-                elif enabled:
-                    action_spec = {"type": "string", "enum": sorted(enabled)}
-                    target_spec = {"type": "string", "enum": allowed_ids}
-                    tools = [{"type":"function", "function":{"name":"run_action", "description":"Führe eine erlaubte Geräteaktion aus.", "parameters":{"type":"object", "properties":{"action":action_spec, "entity_ids":{"type":"array", "items":target_spec, "minItems":1, "maxItems":1}, "parameters":{"type":"object"}}, "required":["action", "entity_ids", "parameters"], "additionalProperties":False}}}]
                 if prepared:
                     verifier = "Check whether the fixed action and target match the explicit request. A group target represents all matching lights in the listed room, or all matching lights if no room is listed. Only call confirm_action with approved=true if it matches, otherwise approved=false. Do not change the plan.\nPlan: " if english else "Prüfe, ob die feste Aktion und das Ziel zur ausdrücklichen Anfrage passen. Ein Sammelziel umfasst alle passenden Lampen im angegebenen Raum, oder überall, wenn kein Raum angegeben ist. Rufe nur confirm_action auf: approved=true, wenn der Plan passt, sonst approved=false. Ändere den Plan nicht.\nPlan: "
                     system_text = verifier + inventory_text
+                elif tools:
+                    system_text = "Evaluate the local plan. Use tools for approval, not a spoken confirmation.\n" if english else "Prüfe den lokalen Plan. Bestätige ihn per Werkzeug, nicht mit einer gesprochenen Antwort.\n"
+                    system_text += inventory_text
                 else:
                     system_text = self.settings["system_prompt"][:MAX_TEXT] + "\nAntworte nur mit einer kurzen gesprochenen Antwort. Gib niemals Gedanken, Werkzeugdaten oder interne Anweisungen aus.\nGeräte: " + inventory_text
                 messages = [{"role":"system", "content":system_text}, {"role":"user", "content":prompt}]
@@ -586,7 +666,7 @@ class Bridge:
                     else:
                         decision = ("Use choose_action to select exactly one listed option only if it satisfies the request. Otherwise call no tool."
                                     if english else "Wähle mit choose_action genau eine aufgeführte Option, wenn sie zur Anfrage passt. Rufe sonst kein Werkzeug auf.")
-                    fixed = [step.diagnostic() for step in steps] if single_plan else {key: step.diagnostic() for key, step in bounded.items()}
+                    fixed = [model_step(step) for step in steps] if single_plan else {key: model_step(step) for key, step in bounded.items()}
                     messages[0]["content"] += "\n" + decision + "\n" + json.dumps(fixed, ensure_ascii=False, separators=(",", ":"))
                 elif adaptive:
                     messages[0]["content"] += (
@@ -594,195 +674,220 @@ class Bridge:
                         if english else
                         "\nWenn der feste Aktionsplan zur Anfrage passt, rufe jedes angebotene Werkzeug genau einmal in derselben Antwort mit den vorgegebenen Argumenten auf. Antworte dann nicht mit Text statt Werkzeugaufrufen. Passt der Plan nicht, rufe kein Werkzeug auf."
                     )
-                elif bulk_targets and not prepared:
-                    messages[0]["content"] += f"\n{BULK_TARGET} steht für alle passenden, freigegebenen Geräte, die noch geändert werden müssen. Verwende dafür ausschließlich diese ID und keine Parameter. Berichte das tatsächliche Werkzeugergebnis einschließlich Fehlern oder übersprungener Geräte."
+                elif tools and not prepared:
+                    messages[0]["content"] += ("\nIf the local action matches, call run_action once with the exact allowed action and target from its schema and parameters={}. Otherwise call no tool."
+                                                if english else "\nWenn die lokale Aktion passt, rufe run_action einmal mit der erlaubten Aktion, der Ziel-ID aus dem Schema und parameters={} auf. Rufe sonst kein Werkzeug auf.")
+                    if bulk_targets:
+                        messages[0]["content"] += f"\n{BULK_TARGET} = alle passenden, freigegebenen Geräte im angeforderten Umfang."
                 elif selection == "clarify":
                     messages[0]["content"] += "\nDie Geräteauswahl ist nicht eindeutig oder der Umfang nicht sicher. Verwende höchstens die lokale Auswahl als Vorschläge für eine Rückfrage; rate keine Ziele aus dem Katalog. Bitte um einen eindeutigen Gerätenamen oder Raum. Schalte nichts."
                 elif not enabled:
                     messages[0]["content"] += "\nFür diese Anfrage ist kein Gerätewerkzeug verfügbar. Behaupte nicht, etwas geschaltet zu haben. Beantworte Fragen nur anhand der verfügbaren Geräteinformationen."
                 if language:
                     messages[0]["content"] += "\nSpracheinstellung von Assist: " + language[:35]
-                if dry_run and (adaptive or single_plan or bounded):
+                if dry_run and tools:
                     messages[0]["content"] += "\nDry run: Tool calls are validated but do not control devices." if english else "\nTrockenlauf: Werkzeugaufrufe werden geprüft, schalten aber keine Geräte."
-                elif dry_run and not prepared:
-                    messages[0]["content"] += "\nTrockenlauf: Es wird nichts geschaltet. Beschreibe geplante Aktionen als Vorschau."
-                return messages, tools
+                timings["context_build_ms"] = timings.get("context_build_ms", 0.0) + (time.perf_counter() - context_started) * 1000
+                return messages
 
-            def estimate(messages, tools):
+            def estimate(payload):
                 # Heuristic for unknown tokenizers, not a provider token count or guarantee.
                 serialization_started = time.perf_counter()
-                size = len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 timings["serialization_ms"] = timings.get("serialization_ms", 0.0) + (time.perf_counter() - serialization_started) * 1000
                 return (size + 1) // 2 + ENVELOPE_RESERVE + MAX_OUTPUT_TOKENS
 
             budget = {"limit": self.settings["llm_context_budget"], "source": "utf8_bytes_divided_by_2_plus_reserves", "output_reserve": MAX_OUTPUT_TOKENS, "envelope_reserve": ENVELOPE_RESERVE, "mode": "full" if full_mode else "filtered", "fallback": False, "catalog_count": len(catalog_inventory), "selected_count": len(inventory), "rounds": []}
             details["context_budget"] = budget
-            messages, tools = build_request(full_mode)
-            initial_estimate = estimate(messages, tools)
-            if full_mode and initial_estimate > budget["limit"]:
-                budget.update(mode="filtered", fallback=True, full_estimate=initial_estimate, overflow=initial_estimate - budget["limit"])
-                messages, tools = build_request(False)
-            timings["tool_and_context_build_ms"] = (time.perf_counter() - tools_started) * 1000 - timings["serialization_ms"]
+            messages = build_request(full_mode)
+            effort = REASONING_EFFORT[self.settings["llm_reasoning"]]
+            payload = {"model": self.settings["llm_model"], "messages": messages, "max_tokens": MAX_OUTPUT_TOKENS}
+            if effort is not None:
+                payload["reasoning_effort"] = effort
+            if tools:
+                payload["tools"] = tools
+            estimated = estimate(payload)
+            if full_mode and estimated > budget["limit"]:
+                budget.update(mode="filtered", fallback=True, full_estimate=estimated, overflow=estimated - budget["limit"])
+                payload["messages"] = build_request(False)
+                estimated = estimate(payload)
+            timings["tool_and_context_build_ms"] = timings["schema_generation_ms"] + timings["context_build_ms"]
             details["selection_ms"] = elapsed_ms(selection_started)
             details["selection"]["catalog_entities"] = catalog_inventory if full_mode and not budget["fallback"] else []
-            details["selection"]["active_actions"] = enabled
-            details["selection"]["offered_actions"] = sorted({step.action for step in (*steps, *bounded.values())})
-            details["selection"]["offered_tools"] = tools
-            details["selection"]["strategy"] = "single_plan" if single_plan else "bounded_choice" if bounded else "multi_approval" if adaptive else "legacy" if tools else "none"
-            effort = REASONING_EFFORT[self.settings["llm_reasoning"]]
-            for round_index in range(4):
-                payload = {"model": self.settings["llm_model"], "messages":messages, "max_tokens": MAX_OUTPUT_TOKENS}
-                if effort is not None:
-                    payload["reasoning_effort"] = effort
-                if tools and round_index == 0:
-                    payload["tools"] = tools
-                estimated = estimate(messages, payload.get("tools", []))
-                budget["estimate"] = estimated
-                budget["rounds"].append({"round": round_index + 1, "estimate": estimated})
-                if estimated > budget["limit"]:
-                    budget["overflow"] = estimated - budget["limit"]
-                    raise AuralisError("LLM-Kontextbudget überschritten; Anfrage oder Geräteauswahl ist zu groß.")
-                data = await self.timed_request("llm", details, started, sequence=1 + round_index + len(results), payload=payload)
-                choice = data["choices"][0]
-                msg = choice["message"]
-                calls = msg.get("tool_calls")
-                if calls is None:
-                    calls = []
-                if not isinstance(calls, list) or len(calls) > MAX_STEPS:
-                    raise AuralisError("Die Anbieterantwort enthält ungültige Werkzeugaufrufe.")
-                request = details["requests"][-1]
+            budget["estimate"] = estimated
+            budget["rounds"].append({"round": 1, "estimate": estimated})
+            if estimated > budget["limit"]:
+                budget["overflow"] = estimated - budget["limit"]
+                details["action_outcome"] = "context_budget_exceeded"
+                raise AuralisError("LLM-Kontextbudget überschritten; Anfrage oder Geräteauswahl ist zu groß.")
+            data = await self.timed_request("llm", details, started, payload=payload, expected_tools=expected_tools)
+            validation_started = time.perf_counter()
+            request = details["requests"][-1]
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) or not isinstance(choices[0].get("message"), dict):
+                details["action_outcome"] = "model_invalid_response"
+                raise AuralisError("Die Anbieterantwort enthält keine eindeutige Modellnachricht.")
+            choice = choices[0]
+            msg = choice["message"]
+            reason = choice.get("finish_reason")
+            request["finish_reason"] = reason[:128] if isinstance(reason, str) else None
+            calls = msg.get("tool_calls")
+            if calls is None:
+                calls = []
+            if isinstance(calls, list):
                 request["tool_calls"] = len(calls)
-                reasoning = provider_reasoning(msg)
-                if reasoning:
-                    request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"], limit=None)
-                if choice.get("finish_reason") == "length":
-                    raise AuralisError("Das Modell hat das Ausgabelimit erreicht. In dieser Runde wurde keine Aktion ausgeführt.")
+                request["selected_tools"] = [function["name"][:256] for item in calls[:MAX_STEPS]
+                                             if isinstance(item, dict) and isinstance(function := item.get("function"), dict)
+                                             and isinstance(function.get("name"), str)]
+            reasoning = provider_reasoning(msg)
+            if reasoning:
+                request["reasoning"] = self.redact(reasoning, url=self.settings["llm_url"], limit=None)
+            if reason == "length":
+                details["action_outcome"] = "model_output_truncated"
+                raise AuralisError("Das Modell hat das Ausgabelimit erreicht. In dieser Runde wurde keine Aktion ausgeführt.")
+            invalid = "Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf."
+            expected_calls = 1 if single_plan or bounded else len(steps)
+            if (reason not in (None, "stop", "tool_calls") or not isinstance(calls, list)
+                    or reason == "tool_calls" and not calls
+                    or calls and (msg.get("refusal") or not payload.get("tools") or len(calls) != expected_calls or len(calls) > MAX_STEPS
+                                  or not all(isinstance(call, dict) and isinstance(call.get("id"), str) and 0 < len(call["id"]) <= 256 and call["id"].strip() for call in calls)
+                                  or len({call["id"] for call in calls}) != len(calls))):
+                details["action_outcome"] = "model_invalid_tool_calls"
                 if prepared or single_plan:
-                    if not calls:
-                        details["confirmation"]["state"] = "missing"
-                        return await finish(unconfirmed)
                     details["confirmation"]["state"] = "invalid"
-                    if len(calls) != 1:
-                        raise AuralisError("Die Anbieterantwort enthält keinen gültigen Bestätigungsaufruf für die vorbereitete Aktion.")
-                    name, approval = _tool_arguments(calls[0])
-                    if name != ("approve_plan" if single_plan else "confirm_action"):
-                        raise AuralisError("Die Anbieterantwort enthält keinen gültigen Bestätigungsaufruf für die vorbereitete Aktion.")
-                    if set(approval) != {"approved"} or type(approval["approved"]) is not bool:
-                        raise AuralisError("Das Modell darf die vorbereitete Aktion nur bestätigen oder ablehnen, nicht verändern.")
-                    details["confirmation"]["state"] = "approved" if approval["approved"] else "rejected"
-                    if not approval["approved"]:
-                        return await finish(unconfirmed)
+                raise AuralisError(invalid)
+            if calls:
+                details["action_outcome"] = "model_invalid_tool_calls"
+                parsed = [_tool_arguments(call) for call in calls]
+            elif payload.get("tools"):
+                details["action_outcome"] = "model_no_tool_calls"
+            if prepared or single_plan:
                 if not calls:
-                    if bounded:
-                        if memory_key:
-                            self.memory.remember(memory_key, resolved.entities and [resolved.entities[0]["id"]], catalog,
-                                                 source="clarification", pending=PendingChoice(prompt, language, _signatures(resolved.choices, resolved.entities)))
-                        if matches.get("intent_source") == "configured_light_comfort":
-                            return await finish("First: brightness to 30 percent, or second: warm white?" if english else "Erste: Helligkeit auf 30 Prozent, oder zweite: Warmweiß?")
-                        return await finish("The first or the second action? Nothing was changed." if english else "Die erste oder die zweite Aktion? Nichts wurde geändert.")
-                    if steps and not results:
-                        return await finish("I couldn't confirm the action plan." if english else "Ich konnte den Aktionsplan nicht bestätigen.")
-                    if selection == "clarify":
-                        return await finish("Please clarify the targets or action. Nothing was changed." if english else "Bitte sag genauer, welche Geräte oder Aktion du meinst. Nichts wurde geändert.")
-                    if selection == "no_action":
-                        return await finish("The requested action isn't supported or allowed for that target." if english else "Diese Aktion wird für das Ziel nicht unterstützt oder ist nicht freigegeben.")
-                    content = msg.get("content") or ""
-                    if reasoning and isinstance(content, str):
-                        content = content.lstrip().removeprefix(reasoning)
-                    return await finish(clean(content))
-                invalid = "Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf."
-                expected_calls = 1 if single_plan or bounded else len(steps)
-                if not payload.get("tools") or not expected_calls or round_index or len(calls) != expected_calls or not all(isinstance(call, dict) and isinstance(call.get("id"), str) and 0 < len(call["id"]) <= 256 for call in calls) or len({call["id"] for call in calls}) != len(calls):
-                    raise AuralisError(invalid)
-                request["selected_tools"] = [_tool_arguments(call)[0] for call in calls]
-                ordered_calls = calls
+                    details["confirmation"]["state"] = "missing"
+                    return await finish(unconfirmed)
+                details["confirmation"]["state"] = "invalid"
+                name, approval = parsed[0]
+                if name != ("approve_plan" if single_plan else "confirm_action"):
+                    raise AuralisError("Die Anbieterantwort enthält keinen gültigen Bestätigungsaufruf für die vorbereitete Aktion.")
+                if set(approval) != {"approved"} or type(approval["approved"]) is not bool:
+                    raise AuralisError("Das Modell darf die vorbereitete Aktion nur bestätigen oder ablehnen, nicht verändern.")
+                details["confirmation"]["state"] = "approved" if approval["approved"] else "rejected"
+                if not approval["approved"]:
+                    details["action_outcome"] = "model_rejected_plan"
+                    return await finish(unconfirmed)
+            if not calls:
                 if bounded:
-                    name, args = _tool_arguments(calls[0])
-                    if name != "choose_action" or set(args) != {"choice"} or not isinstance(args["choice"], str) or args["choice"] not in bounded:
+                    if memory_key:
+                        self.memory.remember(memory_key, resolved.entities and [resolved.entities[0]["id"]], catalog,
+                                             source="clarification", pending=PendingChoice(prompt, language, _signatures(resolved.choices, resolved.entities)))
+                    if matches.get("intent_source") == "configured_light_comfort":
+                        return await finish("First: brightness to 30 percent, or second: warm white?" if english else "Erste: Helligkeit auf 30 Prozent, oder zweite: Warmweiß?")
+                    return await finish("The first or the second action? Nothing was changed." if english else "Die erste oder die zweite Aktion? Nichts wurde geändert.")
+                if steps:
+                    return await finish("I couldn't confirm the action plan." if english else "Ich konnte den Aktionsplan nicht bestätigen.")
+                if selection == "clarify" or selection == "no_match" and matches.get("action_hints"):
+                    return await finish("Please clarify the targets or action. Nothing was changed." if english else "Bitte sag genauer, welche Geräte oder Aktion du meinst. Nichts wurde geändert.")
+                if selection == "no_action":
+                    return await finish("The requested action isn't supported or allowed for that target." if english else "Diese Aktion wird für das Ziel nicht unterstützt oder ist nicht freigegeben.")
+                content = msg.get("content") or ""
+                if reasoning and isinstance(content, str):
+                    content = content.lstrip().removeprefix(reasoning)
+                return await finish(clean(content) if isinstance(content, str) else "")
+            if bounded:
+                name, args = parsed[0]
+                if name != "choose_action" or set(args) != {"choice"} or not isinstance(args["choice"], str) or args["choice"] not in bounded:
+                    raise AuralisError(invalid)
+                executable = (bound_options[args["choice"]],)
+                details["selection"]["selected_choice"] = args["choice"]
+            elif adaptive:
+                seen = set()
+                by_name = dict(zip(expected_tools, zip(steps, executable)))
+                for name, args in parsed:
+                    if name not in by_name or name in seen:
                         raise AuralisError(invalid)
-                    executable = (bound_options[args["choice"]],)
-                    details["selection"]["selected_choice"] = args["choice"]
-                elif single_plan:
-                    ordered_calls = calls * len(steps)
-                elif adaptive:
-                    indexed = {}
-                    for call in calls:
-                        name, args = _tool_arguments(call)
-                        if name not in plan_tools or name in indexed:
-                            raise AuralisError(invalid)
-                        step = steps[list(plan_tools).index(name)]
-                        if not valid_parameters(step.action, args, step.schema) or args != executable[list(plan_tools).index(name)].parameters:
-                            raise AuralisError(invalid)
-                        indexed[name] = call
-                    ordered_calls = [indexed[name] for name in plan_tools]
-                elif not prepared:
-                    name, args = _tool_arguments(calls[0])
-                    if name != "run_action" or args != {"action": steps[0].action, "entity_ids": allowed_ids, "parameters": {}}:
+                    step, bound = by_name[name]
+                    if not valid_parameters(step.action, args, step.schema) or args != bound.parameters:
                         raise AuralisError(invalid)
+                    seen.add(name)
+            elif not (prepared or single_plan):
+                name, args = parsed[0]
+                if name != "run_action" or args != {"action": steps[0].action, "entity_ids": allowed_ids, "parameters": {}}:
+                    raise AuralisError(invalid)
 
-                details["selection"]["parameters_validated"] = True
-                if area := matches.get("voice_area"):
-                    if policy.voice_area_id(*voice_origin) != area or any(getattr(policy._area(target), "id", None) != area for step in executable for target in step.targets):
-                        details["selection"]["preflight_failed"] = "voice_area_changed"
-                        return await finish("The room changed. Nothing was changed." if english else "Der Raum hat sich geändert. Nichts wurde geändert.")
-                if matches.get("intent_source") == "configured_light_comfort" and self.settings["llm_light_comfort"] is not True:
-                    details["selection"]["preflight_failed"] = "comfort_disabled"
-                    return await finish("That interpretation is no longer enabled. Nothing was changed." if english else "Diese Auslegung ist nicht mehr aktiviert. Nichts wurde geändert.")
-                for step in executable:
-                    if step.state_basis and not policy.basis_matches(step.targets[0], step.state_basis):
-                        details["selection"]["preflight_failed"] = "live_value_changed"
-                        return await finish("The device state changed. Nothing was changed." if english else "Der Gerätezustand hat sich geändert. Nichts wurde geändert.")
+            details["selection"]["parameters_validated"] = True
+            timings["model_validation_ms"] = (time.perf_counter() - validation_started) * 1000
+            preflight_started = time.perf_counter()
+            details["action_outcome"] = "preflight_rejected"
+            policy = self.policy()
+
+            def reject_preflight(reason):
+                details["selection"]["preflight_failed"] = reason
+                timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
+
+            if area := matches.get("voice_area"):
+                if policy.voice_area_id(*voice_origin) != area or any(getattr(policy._area(target), "id", None) != area for step in executable for target in step.targets):
+                    reject_preflight("voice_area_changed")
+                    return await finish("The room changed. Nothing was changed." if english else "Der Raum hat sich geändert. Nichts wurde geändert.")
+            if matches.get("intent_source") == "configured_light_comfort" and self.settings["llm_light_comfort"] is not True:
+                reject_preflight("comfort_disabled")
+                return await finish("That interpretation is no longer enabled. Nothing was changed." if english else "Diese Auslegung ist nicht mehr aktiviert. Nichts wurde geändert.")
+            for step in executable:
+                if step.state_basis and not policy.basis_matches(step.targets[0], step.state_basis):
+                    reject_preflight("live_value_changed")
+                    return await finish("The device state changed. Nothing was changed." if english else "Der Gerätezustand hat sich geändert. Nichts wurde geändert.")
+                for targets, leaves in _batches(step):
+                    checked = policy.preflight(step.action, targets, step.parameters, context, user=user, expected_leaves=leaves)
+                    if _failed(checked):
+                        reject_preflight(checked)
+                        return await finish("The targets are no longer available or authorized. Nothing was changed." if english else "Die Ziele sind nicht mehr verfügbar oder freigegeben. Nichts wurde geändert.")
+
+            details["selection"]["preflight_passed"] = True
+            timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
+            execution_started = time.perf_counter()
+            details["action_outcome"] = "execution_failed"
+            stopped = False
+            for step in executable:
+                tool_started = time.perf_counter()
+                action, ids, params = step.action, step.targets, step.parameters
+                result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
+                if stopped:
+                    result["skipped"] = [{"entity_id": target, "reason": "earlier action failed"} for target in ids]
+                elif step.state_basis and not policy.basis_matches(ids[0], step.state_basis):
+                    stopped = True
+                    result["errors"] = [{"entity_id": ids[0], "reason": "live value changed"}]
+                else:
                     for targets, leaves in _batches(step):
-                        checked = policy.preflight(step.action, targets, step.parameters, context, user=user, expected_leaves=leaves)
-                        if _failed(checked):
-                            details["selection"]["preflight_failed"] = self.sanitize_diagnostics(checked)
-                            return await finish("The targets are no longer available or authorized. Nothing was changed." if english else "Die Ziele sind nicht mehr verfügbar oder freigegeben. Nichts wurde geändert.")
-
-                details["selection"]["preflight_passed"] = True
-                if not (single_plan or bounded):
-                    messages.append({"role":"assistant", "content":None, "tool_calls":calls})
-                stopped = False
-                for step, call in zip(executable, ordered_calls):
-                    tool_started = time.perf_counter()
-                    action, ids, params = step.action, step.targets, step.parameters
-                    result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
-                    if stopped:
-                        result["skipped"] = [{"entity_id": target, "reason": "earlier action failed"} for target in ids]
-                    elif step.state_basis and not policy.basis_matches(ids[0], step.state_basis):
-                        stopped = True
-                        result["errors"] = [{"entity_id": ids[0], "reason": "live value changed"}]
-                    else:
-                        for targets, leaves in _batches(step):
-                            batch = await policy.run(action, targets, params, context, dry_run=dry_run, user=user, expected_leaves=leaves)
-                            for key in result:
-                                result[key].extend(batch[key])
-                            if _failed(batch):
-                                stopped = True
-                                result["skipped"].extend({"entity_id": target, "reason": "earlier batch failed"} for target in ids[ids.index(targets[-1]) + 1:])
-                                break
-                    if len(executable) == 1:
-                        result["skipped"].extend({"entity_id": item["id"], "reason": "not in the permitted scope"} for item in details["selection"]["matched_scope"] if item["status"] == "not_allowed")
-                    logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
-                    visible_result = {key: len(items) for key, items in result.items()} if bulk_targets else result | {"errors": [{key: value for key, value in error.items() if key != "detail"} for error in result.get("errors", [])]}
-                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "sequence":1 + len(details["requests"]) + len(results), "started_ms":round((tool_started - started) * 1000), "duration_ms":elapsed_ms(tool_started)})
-                    if not (single_plan or bounded):
-                        messages.append({"role":"tool", "tool_call_id":call["id"], "content":json.dumps(visible_result, ensure_ascii=False)[:MAX_TEXT]})
-                if memory_key and all(not _failed(item["result"]) for item in results):
-                    last = executable[-1]
-                    self.memory.remember(memory_key, last.scope, catalog, source="executed", action=last.action, parameters=last.parameters, correction=correction)
-                if prepared:
-                    return await finish(switch_response(action, result, dry_run=dry_run, english=english))
-                if adaptive or single_plan or bounded or not dry_run or any(_failed(item["result"]) for item in results):
-                    count = sum(len(item["result"]["planned" if dry_run else "executed"]) for item in results)
-                    missed = any(_failed(item["result"]) for item in results)
-                    if english:
-                        answer = f"{count} device operations {'planned' if dry_run else 'completed'}." + (" Some operations could not be completed." if missed else "")
-                    else:
-                        answer = f"{count} Geräteaktionen {'geplant' if dry_run else 'ausgeführt'}." + (" Einige Aktionen waren nicht möglich." if missed else "")
-                    return await finish(answer)
-            raise AuralisError("Zu viele Werkzeugrunden ohne finale LLM-Antwort.")
+                        batch = await policy.run(action, targets, params, context, dry_run=dry_run, user=user, expected_leaves=leaves)
+                        for key in result:
+                            result[key].extend(batch[key])
+                        if _failed(batch):
+                            stopped = True
+                            result["skipped"].extend({"entity_id": target, "reason": "earlier batch failed"} for target in ids[ids.index(targets[-1]) + 1:])
+                            break
+                if len(executable) == 1:
+                    result["skipped"].extend({"entity_id": item["id"], "reason": "not in the permitted scope"} for item in details["selection"]["matched_scope"] if item["status"] == "not_allowed")
+                logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
+                results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "sequence":1 + len(details["requests"]) + len(results), "started_ms":round((tool_started - started) * 1000), "duration_ms":elapsed_ms(tool_started)})
+            timings["execution_ms"] = (time.perf_counter() - execution_started) * 1000
+            count = sum(len(item["result"]["planned" if dry_run else "executed"]) for item in results)
+            missed = any(_failed(item["result"]) for item in results)
+            if count and missed:
+                details["action_outcome"] = "dry_run_partial" if dry_run else "partial_failure"
+            elif count:
+                details["action_outcome"] = "dry_run_validated" if dry_run else "executed"
+            if memory_key and not missed:
+                last = executable[-1]
+                self.memory.remember(memory_key, last.scope, catalog, source="executed", action=last.action, parameters=last.parameters, correction=correction)
+            if prepared:
+                return await finish(switch_response(action, result, dry_run=dry_run, english=english))
+            if english:
+                answer = f"{count} device {'operation' if count == 1 else 'operations'} {'planned' if dry_run else 'completed'}." + (" Some operations could not be completed." if missed else "")
+            else:
+                answer = f"{count} {'Geräteaktion' if count == 1 else 'Geräteaktionen'} {'geplant' if dry_run else 'ausgeführt'}." + (" Einige Aktionen waren nicht möglich." if missed else "")
+            return await finish(answer)
         except Exception as error:
             detail = self.redact(diagnostic(error))
+            details["error"] = detail
             details["duration_ms"] = elapsed_ms(started)
             sanitize_history()
             await self.record("llm", dry_run, input=history_input, tools=results, error=detail, diagnostics=details)

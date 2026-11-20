@@ -76,3 +76,12 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Vom Gerät nicht unterstützt", fields["Teilschritt 2"])
         self.assertIn("Mehrere passende Geräte", fields["Teilschritt 3"])
         self.assertIn("Gerätename und Gerätetyp passen nicht zusammen", fields["Teilschritt 3"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for the offline panel test")
+    def test_test_panel_distinguishes_delivered_tools_from_missing_calls(self):
+        script = "global.HTMLElement = class {}; global.customElements = { get: () => true };\n"
+        script += (ROOT / "panel.js").read_text()
+        script += "\nconst panel = Object.create(AuralisPanel.prototype); console.log(panel.testDiagnostics({action_outcome:'model_no_tool_calls', requests:[{tool_delivery:'sent', tool_names:['set_light_color']}]}));"
+        output = subprocess.check_output(["node", "-"], input=script, text=True)
+        self.assertIn("Werkzeuge gesendet: set_light_color", output)
+        self.assertIn("Modellantwort ohne Werkzeugaufruf", output)

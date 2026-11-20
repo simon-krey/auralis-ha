@@ -245,6 +245,8 @@ def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_n
         trace["value_source"] = basis[0]
     else:
         parameters = _parameter_values(action, prompt, trace, schema)
+    if parameters and (unsupported := sorted(parameters.keys() - schema.keys())):
+        return Resolution("no_action", entities, trace=trace | {"reason": "unsupported_action_parameters", "unsupported_parameters": unsupported})
     if parameters is None or not valid_parameters(action, parameters, schema):
         return Resolution("clarify", entities, trace=trace | {"reason": "missing_ambiguous_or_unsupported_parameters"})
     members = {target: tuple(item.get("members", (target,))) for target, item in specs.items()}

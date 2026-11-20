@@ -295,7 +295,7 @@ class ActionPolicy:
         domain = state.entity_id.split(".", 1)[0]
         return domain in {"lock", "alarm_control_panel", "script", "siren", "button", "input_button"} or (domain == "cover" and state.attributes.get("device_class") not in {"blind", "curtain", "shade", "shutter", "awning"})
 
-    def _enabled(self, state, action):
+    def _default_enabled(self, state):
         default = state.entity_id.partition(".")[0] in _DEFAULT_DOMAINS and not self._sensitive(state)
         if default:
             entry = self._registry_entry(state.entity_id)
@@ -305,6 +305,11 @@ class ActionPolicy:
             )
         if default and state.entity_id.startswith("scene."):
             default = self._scene_safe(state, None, defaults_only=True)
+        return default
+
+    def _enabled(self, state, action, *, default=None):
+        if default is None:
+            default = self._default_enabled(state)
         value = self.overrides.get(f"{state.entity_id}:{action}", default)
         return value is True, default
 
@@ -358,7 +363,9 @@ class ActionPolicy:
             domain = entity_id.split(".", 1)[0]
             actions = []
             group = timed("group", self._group, state)
-            for action, (label, domains, _, params) in (_ACTIONS.items() if group else _DOMAIN_ACTIONS.get(domain, ())):
+            domain_actions = _ACTIONS.items() if group else _DOMAIN_ACTIONS.get(domain, ())
+            default = self._default_enabled(state) if domain_actions else False
+            for action, (label, domains, _, params) in domain_actions:
                 if domain not in domains:
                     if not group:
                         continue
@@ -367,7 +374,7 @@ class ActionPolicy:
                             continue
                     except ValueError:
                         continue
-                configured, default = self._enabled(state, action)
+                configured, _ = self._enabled(state, action, default=default)
                 enabled = configured
                 members = None
                 supported = timed("capability", _capability, state, action)

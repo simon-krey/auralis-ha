@@ -24,6 +24,8 @@ Wenn mehrere Entitäten denselben Gerätenamen teilen, grenzt ein Zusatz wie „
 
 Die Sprachsteuerung versteht „auf die Hälfte“, „zweiundzwanzig Grad“, „heller“, „leiser“, „zehn Prozentpunkte“, „Warmweiß“ und „Türkis“. Ein unqualifiziertes „heller“/„dunkler“ oder „lauter“/„leiser“ bedeutet zehn Prozentpunkte; „etwas“ fragt nach. Relative Werte benötigen einen gültigen aktuellen Gerätezustand. Mehrdeutige Rückbezüge und Werte außerhalb des erlaubten Bereichs werden nicht geraten oder still korrigiert. [Details und Benchmarks](docs/action-resolver-v3-results.md).
 
+Der LLM-Test und der Verlauf unterscheiden lokal geplante Aktionen, tatsächlich gesendete Werkzeuge, fehlende Modellaufrufe und abgelehnte Ausführungen. Mit `gemma4:e2b` bestand der Hue-Go-Befehl zum Einschalten und Umfärben im Messlauf mit **Gesamten Plan einmal bestätigen**; die Werkzeugstrategie bleibt einstellbar. [HTTP-Prüfung und Modellmessung](docs/action-resolver-v3-delivery.md).
+
 In derselben nativen Assist-Konversation kann „Mach sie blau“ auf ein zuvor bestätigtes Ziel verweisen. Diese Referenzen verfallen nach fünf Minuten und werden nicht zwischen Benutzern oder Satelliten geteilt. Für bedingte Befehle, uneindeutige Verweise und relative Angaben ohne festgelegten Schritt fragt Auralis nach oder führt nichts aus. Details zur [Architektur und zum Offline-Benchmark](docs/action-resolver-v2-results.md).
 
 <!-- ha-marketplace:exclude-start -->

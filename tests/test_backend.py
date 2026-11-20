@@ -10,7 +10,11 @@ ROOT = pathlib.Path(__file__).parents[1] / "custom_components" / "auralis"
 package = types.ModuleType("bridge_test")
 package.__path__ = [str(ROOT)]
 sys.modules["bridge_test"] = package
-for name in ("aiohttp", "homeassistant", "homeassistant.helpers", "homeassistant.helpers.aiohttp_client", "homeassistant.helpers.storage"):
+try:
+    import aiohttp
+except ImportError:
+    sys.modules.setdefault("aiohttp", types.ModuleType("aiohttp"))
+for name in ("homeassistant", "homeassistant.helpers", "homeassistant.helpers.aiohttp_client", "homeassistant.helpers.storage"):
     sys.modules.setdefault(name, types.ModuleType(name))
 sys.modules["homeassistant.helpers.aiohttp_client"].async_get_clientsession = lambda hass: None
 sys.modules["homeassistant.helpers.storage"].Store = object
@@ -94,7 +98,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await obj.prune()
         self.assertEqual(obj.entries, [])
 
-    async def test_reasoning_setting_applies_to_every_llm_round(self):
+    async def test_reasoning_setting_applies_to_the_approval_request(self):
         bridge = self.bridge()
         policy = Policy()
         policy.entities = [entity("switch.room", "Room", None, "turn_on", state="off")]
@@ -104,9 +108,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         async def request(kind, *, payload):
             self.assertEqual(kind, "llm")
             payloads.append(payload)
-            if len(payloads) == 1:
-                return tool_response("turn_on", "switch.room")
-            return {"choices": [{"message": {"content": "Erledigt"}}]}
+            return tool_response("turn_on", "switch.room")
 
         bridge.request = request
         self.assertEqual(bridge.public_settings()["llm_reasoning"], "default")
@@ -116,7 +118,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bridge.store.data["settings"]["llm_reasoning"], mode)
                 payloads.clear()
                 await bridge.chat("Room an", "de", "context", "user", dry_run=True)
-                self.assertEqual(len(payloads), 2)
+                self.assertEqual(len(payloads), 1)
                 for payload in payloads:
                     self.assertEqual(payload.get("reasoning_effort"), expected)
                     self.assertEqual("reasoning_effort" in payload, expected is not None)
@@ -222,7 +224,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertGreaterEqual(details["duration_ms"], details["requests"][0]["duration_ms"])
 
-    async def test_tool_loop_dry_run_and_disabled_action(self):
+    async def test_dry_run_diagnostics_and_disabled_action(self):
         obj = self.bridge()
         policy = Policy()
         policy.entities[0]["id"] = "switch.room"
@@ -230,12 +232,12 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         requests = []
         async def request(kind, *, payload=None, form=None):
             requests.append(payload)
-            if len(requests) == 1:
-                return {"choices":[{"message":{"reasoning_content":"Ich prüfe secret2 vor dem Aufruf", "tool_calls":[{"id":"1", "type":"function", "function":{"name":"run_action", "arguments":'{"action":"turn_on","entity_ids":["switch.room"],"parameters":{}}'}}]}}]}
-            return {"choices":[{"message":{"content":"<think>private</think>Erledigt"}}], "usage": {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146, "provider_debug": "private"}}
+            response = tool_response("turn_on", "switch.room")
+            response["choices"][0]["message"].update(content="Erledigt", reasoning_content="Ich prüfe secret2 vor dem Aufruf")
+            return response | {"usage": {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146, "provider_debug": "private"}}
         obj.request = request
         result = await obj.chat("Room an", "de", "context", "user", dry_run=True)
-        self.assertEqual(result["answer"], "Erledigt")
+        self.assertEqual(result["answer"], "1 Geräteaktion geplant.")
         self.assertEqual(result["tools"][0]["result"]["planned"], ["switch.room"])
         self.assertEqual(obj.entries[0]["tools"][0]["parameters"], {})
         self.assertTrue(obj.entries[0]["test"])
@@ -246,16 +248,13 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(details["selection"]["status"], "matched")
         self.assertEqual(list(details["selection"]["action_parameters"]), ["turn_on"])
         self.assertEqual(details["selection"]["entities"][0]["id"], "switch.room")
-        self.assertEqual([item["tool_calls"] for item in details["requests"]], [1, 0])
-        self.assertEqual(details["requests"][1]["usage"], {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146})
+        self.assertEqual([item["tool_calls"] for item in details["requests"]], [1])
+        self.assertEqual(details["requests"][0]["usage"], {"prompt_tokens": 128, "completion_tokens": 18, "total_tokens": 146})
         self.assertEqual(details["requests"][0]["reasoning"], "Ich prüfe [redigiert] vor dem Aufruf")
-        self.assertEqual(details["requests"][1]["reasoning"], "private")
-        first, second = [item["request"]["body"] for item in details["requests"]]
+        first, = [item["request"]["body"] for item in details["requests"]]
         self.assertEqual([message["role"] for message in first["messages"]], ["system", "user"])
         self.assertEqual(first["tools"], requests[0]["tools"])
-        self.assertEqual([message["role"] for message in second["messages"]], ["system", "user", "assistant", "tool"])
-        self.assertEqual([details["requests"][0]["sequence"], result["tools"][0]["sequence"], details["requests"][1]["sequence"]], [1, 2, 3])
-        self.assertNotIn("Ich prüfe", str(requests[1]["messages"]))
+        self.assertEqual([details["requests"][0]["sequence"], result["tools"][0]["sequence"]], [1, 2])
         self.assertGreaterEqual(details["duration_ms"], details["selection_ms"])
         self.assertGreaterEqual(result["tools"][0]["duration_ms"], 0)
 
@@ -423,7 +422,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             await bridge.chat("Room an", "de", "context", "user", dry_run=True)
         self.assertEqual(policy.calls, [])
 
-    async def test_followup_budget_blocks_second_request(self):
+    async def test_dry_run_never_resends_model_output_for_a_summary(self):
         bridge = self.bridge()
         policy = Policy()
         policy.entities = [entity("switch.room", "Room", None, "turn_on")]
@@ -437,11 +436,11 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             return response
         bridge.request = request
         details = {}
-        with self.assertRaisesRegex(backend.AuralisError, "Kontextbudget"):
-            await bridge.chat("Room on", "en", "context", "user", dry_run=True, details=details)
+        result = await bridge.chat("Room on", "en", "context", "user", dry_run=True, details=details)
+        self.assertEqual(result["answer"], "1 device operation planned.")
         self.assertEqual(calls, 1)
         self.assertEqual(len(policy.calls), 1)
-        self.assertEqual(len(details["context_budget"]["rounds"]), 2)
+        self.assertEqual(len(details["context_budget"]["rounds"]), 1)
 
     async def test_full_catalog_is_present_without_granting_tools(self):
         bridge = self.bridge()
