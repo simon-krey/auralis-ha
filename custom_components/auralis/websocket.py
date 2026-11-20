@@ -5,12 +5,13 @@ import time
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import Context
+from homeassistant.helpers import area_registry, entity_registry
 from .backend import AuralisError, elapsed_ms
 from .const import DOMAIN, MAX_AUDIO, MAX_TEXT
 
 
 def register(hass):
-    for handler in (get, save, action, reset_actions, models, test_llm, test_stt, history, audio, clear):
+    for handler in (get, save, action, reset_actions, models, warm_model, test_llm, test_stt, history, audio, clear):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -32,7 +33,9 @@ async def execute(connection, msg, operation):
 async def get(hass, connection, msg):
     async def run():
         bridge = hass.data[DOMAIN]
-        return {"settings": bridge.public_settings(), "entities": bridge.policy().catalog(user=connection.user)}
+        return {"settings": bridge.public_settings(), "entities": bridge.policy().catalog(user=connection.user),
+                "voice_areas": [{"id": area.id, "name": area.name} for area in area_registry.async_get(hass).async_list_areas()],
+                "voice_satellites": [entity_id for entity_id in entity_registry.async_get(hass).entities if entity_id.startswith("assist_satellite.")]}
     await execute(connection, msg, run)
 
 @command("save", {vol.Required("settings"): dict})
@@ -51,8 +54,7 @@ async def action(hass, connection, msg):
         async with bridge.lock:
             entity = next((e for e in bridge.policy().catalog(user=connection.user) if e["id"] == msg["entity_id"]), None)
             if not entity or not any(a["id"] == msg["action"] for a in entity["actions"]): raise ValueError()
-            bridge.overrides[f'{msg["entity_id"]}:{msg["action"]}'] = msg["enabled"]
-            await bridge.persist()
+            await bridge.save_overrides(bridge.overrides | {f'{msg["entity_id"]}:{msg["action"]}': msg["enabled"]})
             return {}
     await execute(connection, msg, run)
 
@@ -61,13 +63,7 @@ async def reset_actions(hass, connection, msg):
     async def run():
         bridge = hass.data[DOMAIN]
         async with bridge.lock:
-            previous = bridge.overrides.copy()
-            bridge.overrides.clear()
-            try:
-                await bridge.persist()
-            except Exception:
-                bridge.overrides.update(previous)
-                raise
+            await bridge.save_overrides({})
             return {"entities": bridge.policy().catalog(user=connection.user)}
     await execute(connection, msg, run)
 
@@ -80,14 +76,25 @@ async def models(hass, connection, msg):
             return {"error": str(error)}
     await execute(connection, msg, run)
 
-@command("test_llm", {vol.Required("prompt"): str, vol.Optional("language", default="de"): str})
+@command("test_llm", {vol.Required("prompt"): str, vol.Optional("language", default="de"): str, vol.Optional("voice_input"): vol.All(str, vol.Length(max=146))})
 async def test_llm(hass, connection, msg):
     async def run():
         details = {}
         try:
-            return await hass.data[DOMAIN].chat(msg["prompt"], msg["language"], Context(user_id=connection.user.id), connection.user, dry_run=True, details=details)
+            target = msg.get("voice_input")
+            origin = ((None, target) if target.startswith("assist_satellite.") else (target, None)) if target else None
+            return await hass.data[DOMAIN].chat(msg["prompt"], msg["language"], Context(user_id=connection.user.id), connection.user, dry_run=True, details=details, voice_origin=origin)
         except AuralisError as error:
             return {"answer": "", "tools": [], "error": str(error), "diagnostics": details}
+    await execute(connection, msg, run)
+
+@command("warm_model", {})
+async def warm_model(hass, connection, msg):
+    async def run():
+        try:
+            return await hass.data[DOMAIN].warm_model()
+        except AuralisError as error:
+            return {"error": str(error)}
     await execute(connection, msg, run)
 
 @command("test_stt", {vol.Required("audio"): str, vol.Required("mime"): str, vol.Optional("language", default="de"): str})

@@ -34,13 +34,16 @@ class Policy:
         self.entities = [{"id":"light.room", "name":"Room", "area":None, "state":"off", "actions":[{"id":"turn_on", "enabled":True}, {"id":"unlock", "enabled":False}]}]
         self.calls = []
 
-    def catalog(self, user=None, *, for_retrieval=False, trace=None):
-        return self.entities
+    def catalog(self, user=None, *, for_retrieval=False, trace=None, area_id=None):
+        return [entity for entity in self.entities if area_id is None or entity.get("area_id") == area_id]
 
     def preflight(self, action, entity_ids, parameters, context, *, user=None, expected_leaves=None):
         return {"executed": [], "planned": expected_leaves, "skipped": [], "errors": []}
 
-    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None, expected_leaves=None):
+    def in_area(self, target, area):
+        return any(entity["id"] == target and entity.get("area_id") == area for entity in self.entities)
+
+    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None, expected_leaves=None, guard=None):
         assert dry_run and user == "user" and context == "context"
         self.calls.append((action, entity_ids, parameters))
         return {"executed": [], "planned": entity_ids, "skipped": [], "errors": []}

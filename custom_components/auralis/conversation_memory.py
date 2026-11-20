@@ -31,6 +31,7 @@ class Referent:
     parameters: tuple = ()
     pending: PendingChoice | None = None
     correction: tuple[PendingChoice, int] | None = None
+    origin: tuple | None = None
 
     @property
     def ids(self):
@@ -48,18 +49,18 @@ class ConversationMemory:
         entry = self.context(key, catalog)
         return entry.ids if entry and entry.pending is None else ()
 
-    def context(self, key, catalog):
+    def context(self, key, catalog, *, origin=None):
         entry = self._entries.get(key)
         if entry is None:
             return None
         ids = set(entry.ids)
         live = {_identity(entity) for entity in catalog if entity["id"] in ids and entity["state"] not in {"unavailable", "unknown"}}
-        if entry.deadline <= time.monotonic() or any(target not in live for target in entry.identities):
+        if entry.deadline <= time.monotonic() or entry.origin != origin or any(target not in live for target in entry.identities):
             self.forget(key)
             return None
         return entry
 
-    def remember(self, key, targets, catalog, *, source="resolved", action=None, parameters=None, pending=None, correction=None):
+    def remember(self, key, targets, catalog, *, source="resolved", action=None, parameters=None, pending=None, correction=None, origin=None):
         self.forget(key)
         if key is None or not targets or len(targets) > MAX_REFERENTS:
             return
@@ -70,6 +71,6 @@ class ConversationMemory:
         if any(target not in index for target in targets):
             return
         values = tuple((name, tuple(value) if isinstance(value, list) else value) for name, value in (parameters or {}).items())
-        self._entries[key] = Referent(time.monotonic() + TTL, tuple(index[target] for target in dict.fromkeys(targets)), source, action, values, pending, correction)
+        self._entries[key] = Referent(time.monotonic() + TTL, tuple(index[target] for target in dict.fromkeys(targets)), source, action, values, pending, correction, origin)
         if len(self._entries) > MAX_CONVERSATIONS:
             self._entries.popitem(last=False)

@@ -27,6 +27,7 @@ class Case:
     alternative: tuple = ()
     expected_skips: tuple = ()
     delivery: bool = False
+    authenticated: bool = False
 
 
 def corpus(suite, distractors):
@@ -133,7 +134,7 @@ def corpus(suite, distractors):
         Case("Schalte die Bilderleuchte aus", clarify=True),
         Case("Schalte Leselampe und Sofalampe aus", clarify=True, restricted=True),
         Case("Entriegle das Haustürschlos", clarify=True),
-        Case("Entriegle das Haustürschloss", step(lock, "unlock")),
+        Case("Entriegle das Haustürschloss", step(lock, "unlock"), authenticated=True),
         Case("Stell das Einfache Licht auf lila", clarify=True),
         Case("Stelle die Leselampe auf kaltweiß", clarify=True),
         Case("Mach die andere Lampe an", clarify=True, reference=(reading, sofa)),
@@ -223,7 +224,7 @@ async def evaluate(args, bridge, backend):
         cases = tuple(case for case in cases if not case.reference and (case.plan or case.alternative))[-args.model_cases:]
     bridge.policy = lambda: policy
     bridge.settings.update(llm_plan_approval=args.strategy, history_enabled=False, llm_model=args.model or "offline-test",
-                           llm_reasoning=args.reasoning, llm_full_context=args.full_context)
+                           llm_reasoning=args.reasoning, llm_full_context=args.full_context, local_fast_path=args.fast_path)
     live = bool(args.endpoint)
     if live:
         bridge.settings.update(llm_url=args.endpoint, llm_token=os.environ.get("AURALIS_BENCH_TOKEN", ""))
@@ -237,14 +238,17 @@ async def evaluate(args, bridge, backend):
     outcomes = defaultdict(int)
     stages = defaultdict(list)
     action_expected, action_offered = set(), set()
-    resolver_ms, decision_ms, rounds, payload_bytes, estimates, provider_ms = [], [], [], [], [], []
+    resolver_ms, decision_ms, fast_decision_ms, rounds, payload_bytes, estimates, provider_ms = [], [], [], [], [], [], []
     usage = defaultdict(list)
     misses = []
     direct = inspect.signature(backend.resolve).parameters
     for index, case in enumerate(cases):
-        user = SimpleNamespace(id="limited", is_admin=False, is_active=True,
-                               permissions=SimpleNamespace(check_entity=lambda eid, permission: permission == "read" or eid != "light.sofa")) if case.restricted else None
+        user = SimpleNamespace(id="limited", is_admin=case.authenticated, is_active=True,
+                               permissions=SimpleNamespace(check_entity=lambda eid, permission: permission == "read" or eid != "light.sofa")) if case.restricted or case.authenticated else None
         context = SimpleNamespace(user_id=user.id if user else None)
+        async def get_user(user_id):
+            return user if user and user_id == user.id else None
+        bridge.hass.auth = SimpleNamespace(async_get_user=get_user)
         catalog = policy.catalog(user, for_retrieval=True)
         clock = time.perf_counter()
         resolution = backend.resolve(case.text, catalog, case.language, case.reference, **({"comfort": False} if "comfort" in direct else {}))
@@ -284,7 +288,10 @@ async def evaluate(args, bridge, backend):
             totals["complete_validated_actions"] += complete and bool(applied)
             totals["unexpected_or_incomplete_plans"] += bool(applied and not complete)
             if complete:
-                decision_ms.append((time.perf_counter() - started) * 1000)
+                elapsed = (time.perf_counter() - started) * 1000
+                decision_ms.append(elapsed)
+                if details.get("confirmation", {}).get("state") == "local_fast_path":
+                    fast_decision_ms.append(elapsed)
             else:
                 misses.append(case.text)
         except (backend.AuralisError, TimeoutError):
@@ -299,6 +306,7 @@ async def evaluate(args, bridge, backend):
         totals["first_requests_with_tools"] += bool(request.get("offered_tools"))
         totals["first_requests_with_returned_calls"] += bool(request.get("tool_calls"))
         if case.plan:
+            totals["local_fast_path_decisions"] += details.get("confirmation", {}).get("state") == "local_fast_path"
             totals["confirmed_tool_deliveries"] += request.get("tool_delivery", "sent" if request.get("offered_tools") and not request.get("failed") else "unknown") == "sent"
             totals["valid_model_decisions"] += bool(details.get("selection", {}).get("parameters_validated") or details.get("confirmation", {}).get("state") == "rejected")
         if measured := details.get("context_budget", {}).get("rounds"):
@@ -312,17 +320,19 @@ async def evaluate(args, bridge, backend):
                 usage[key].append(count)
     assert not policy.hass.services.calls
     expected_count = max(totals["pipeline_action_cases"], 1)
-    print(json.dumps({"suite": args.suite, "strategy": args.strategy, "reasoning": args.reasoning, "cases": len(cases), "states": len(policy.hass.states.items),
+    model_expected_count = max(totals["pipeline_action_cases"] - totals["local_fast_path_decisions"], 1)
+    print(json.dumps({"suite": args.suite, "strategy": args.strategy, "fast_path": args.fast_path, "reasoning": args.reasoning, "cases": len(cases), "states": len(policy.hass.states.items),
                       "german_cases": sum(case.language == "de" for case in cases), "live_provider": bool(live),
-                      "action_outcomes": outcomes, "tool_delivery_rate": totals["confirmed_tool_deliveries"] / expected_count,
-                      "valid_tool_call_rate": totals["valid_model_decisions"] / expected_count,
+                      "action_outcomes": outcomes, "tool_delivery_rate": totals["confirmed_tool_deliveries"] / model_expected_count,
+                      "valid_tool_call_rate": totals["valid_model_decisions"] / model_expected_count,
                       "complete_action_plan_rate": totals["complete_validated_actions"] / expected_count,
                       **totals, "entity": metric({pair[:2] for pair in action_expected}, {pair[:2] for pair in action_offered}),
                       "action": metric(action_expected, action_offered), "resolver_ms": distribution(resolver_ms),
                       "local_stage_ms": {key: distribution(value) for key, value in stages.items()},
-                      "complete_decision_ms": distribution(decision_ms), "first_request_bytes_mean": round(statistics.mean(payload_bytes), 2) if payload_bytes else None,
+                      "complete_decision_ms": distribution(decision_ms), "local_fast_path_ms": distribution(fast_decision_ms),
+                      "first_request_bytes_mean": round(statistics.mean(payload_bytes), 2) if payload_bytes else None,
                       "first_request_budget_estimate_mean": round(statistics.mean(estimates), 2) if estimates else None,
-                      "model_rounds_mean": statistics.mean(rounds) if live else None, "real_provider_ms": distribution(provider_ms) if live else None,
+                      "model_rounds_mean": statistics.mean(rounds), "real_provider_ms": distribution(provider_ms) if live else None,
                       "first_request_ms_model_temperature_uncontrolled": provider_ms[0] if live and provider_ms else None,
                       "subsequent_real_provider_ms": distribution(provider_ms[1:]) if live else None,
                       "observed_tokens_mean": {key: round(statistics.mean(value), 2) for key, value in usage.items()},
@@ -336,6 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--reasoning", choices=["default", "on", "off"], default="default")
     parser.add_argument("--delivery-cases", action="store_true", help="Use the paired German tool-delivery subset")
     parser.add_argument("--full-context", action="store_true")
+    parser.add_argument("--fast-path", action="store_true", help="Enable local approval for eligible light plans")
     parser.add_argument("--distractors", type=int, default=0)
     parser.add_argument("--target", type=Path, help="A baseline checkout or snapshot with tests and custom_components")
     parser.add_argument("--endpoint")

@@ -221,7 +221,7 @@ class HybridTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_voice_area_never_infers_another_room(self):
         areas = {LIGHT: SimpleNamespace(id="office", name="Büro"), "light.sofa": SimpleNamespace(id="living", name="Wohnzimmer")}
         self.policy._area = areas.get
-        self.policy.voice_area_id = lambda device, satellite: "office" if satellite == "office-satellite" else None
+        self.policy.voice_location = lambda device, satellite, fallback: {"area_id": "office" if satellite == "office-satellite" else None, "verified": True}
         response = calls_response([call("confirm_action", {"approved": True})])
         prompt = "Schalte das Licht hier aus."
         result = await self.chat(prompt, calls_response([]))

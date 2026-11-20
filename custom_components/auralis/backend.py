@@ -2,8 +2,11 @@
 import asyncio
 import base64
 from dataclasses import dataclass
+from copy import deepcopy
 import json
+import logging
 from datetime import datetime, timezone
+from functools import partial
 import re
 import time
 import uuid
@@ -16,18 +19,20 @@ from .actions import ActionPolicy, MAX_ACTION_TARGETS, valid_parameters
 from .const import DEFAULTS, MAX_AUDIO, MAX_TEXT, PLAN_APPROVAL, REASONING_EFFORT
 from .conversation_memory import ConversationMemory, PendingChoice
 from .names import normalize
-from .resolver import MAX_STEPS, Resolution, ResolutionMode, resolve, target_alternatives
-from .retrieval import BULK_TARGET, select_context
+from .resolver import MAX_STEPS, Resolution, ResolutionMode, _VERB, resolve, target_alternatives
+from .retrieval import BULK_TARGET, _QUESTION, select_context
 
 MAX_HISTORY = 99 * 1024 * 1024
 MAX_AGE = 7 * 86400
 MAX_RESPONSE = 1024 * 1024
 MAX_ERROR = 2000
 MAX_OUTPUT_TOKENS = 768
+MAX_APPROVAL_TOKENS = 384
 ENVELOPE_RESERVE = 256
 MAX_PLAN_OPERATIONS = 2048
 _REASONING = re.compile(r"<(think|thinking|analysis|reasoning)\b[^>]*>(.*?)(?:</\1\s*>|$)", re.I | re.S)
 _ORPHAN_REASONING_END = re.compile(r"^.*</(?:think|thinking|analysis|reasoning)\s*>", re.I | re.S)
+_LOGGER = logging.getLogger(__name__)
 
 
 class AuralisError(ValueError):
@@ -42,6 +47,10 @@ class ProviderRejected(AuralisError):
 
 class InvalidProviderResponse(AuralisError):
     """An HTTP success response that cannot be parsed."""
+
+
+class ProviderTimeout(AuralisError):
+    """The provider did not return within the configured deadline."""
 
 
 @dataclass(frozen=True)
@@ -232,12 +241,19 @@ class Bridge:
             self.settings["llm_context_budget"] = DEFAULTS["llm_context_budget"]
         if self.settings["llm_plan_approval"] not in ("multi", "single"):
             self.settings["llm_plan_approval"] = DEFAULTS["llm_plan_approval"]
+        for key in ("voice_room_overrides", "llm_timeout"):
+            try:
+                self._validate_setting(key, self.settings[key], registry=False)
+            except ValueError:
+                self.settings[key] = DEFAULTS[key]
         self.overrides = data.get("overrides", {})
         self.entries = await self.history_store.async_load() or []
         await self.prune(persist=bool(self.entries))
 
-    async def persist(self):
-        await self.store.async_save({"settings": self.settings, "overrides": self.overrides})
+    async def save_overrides(self, overrides):
+        await self.store.async_save({"settings": self.settings, "overrides": overrides})
+        self.overrides.clear()
+        self.overrides.update(overrides)
 
     def public_settings(self):
         result = {k: v for k, v in self.settings.items() if not k.endswith("_token")}
@@ -250,12 +266,7 @@ class Bridge:
             raise ValueError("Ungültige Einstellungen")
         new = dict(self.settings)
         for key, value in values.items():
-            if key in {"history_enabled", "llm_full_context", "llm_light_comfort"}:
-                if not isinstance(value, bool): raise ValueError("Ungültige Einstellungen")
-            elif key == "llm_context_budget":
-                if type(value) is not int or value not in (8000, 16000): raise ValueError("Ungültiges Kontextbudget")
-            elif not isinstance(value, str) or len(value) > MAX_TEXT:
-                raise ValueError("Ungültige Einstellungen")
+            self._validate_setting(key, value)
             if key == "llm_reasoning" and value not in REASONING_EFFORT:
                 raise ValueError("Ungültige Reasoning-Einstellung")
             if key == "llm_plan_approval" and value not in PLAN_APPROVAL:
@@ -263,8 +274,34 @@ class Bridge:
             if key.endswith("_url") and value and not valid_url(value):
                 raise ValueError("Ungültige Endpunkt-URL")
             new[key] = llm_base_url(value) if key == "llm_url" else value
+        await self.store.async_save({"settings": new, "overrides": self.overrides})
         self.settings = new
-        await self.persist()
+
+    def _validate_setting(self, key, value, *, registry=True):
+        if key == "voice_room_overrides":
+            if not isinstance(value, dict) or len(value) > 256:
+                raise ValueError("Ungültige Raumzuordnung")
+            for origin, area in value.items():
+                if not isinstance(origin, str) or not re.fullmatch(r"(?:assist_satellite\.)?[a-zA-Z0-9_-]{1,128}", origin) or not isinstance(area, str) or not re.fullmatch(r"[a-z0-9_-]{1,128}", area):
+                    raise ValueError("Ungültige Raumzuordnung")
+                if registry and self.settings[key].get(origin) != area:
+                    from homeassistant.helpers import area_registry
+                    policy = self.policy()
+                    satellite = origin.startswith("assist_satellite.")
+                    location = policy.voice_location(None if satellite else origin, origin if satellite else None, {})
+                    if not location["verified"] or location["source"] == "conflict" or not area_registry.async_get(self.hass).async_get_area(area):
+                        raise ValueError("Unbekanntes Assist-Gerät oder unbekannter Raum")
+        elif key in {"history_enabled", "llm_full_context", "llm_light_comfort", "local_fast_path"}:
+            if type(value) is not bool:
+                raise ValueError("Ungültige Einstellungen")
+        elif key == "llm_context_budget":
+            if type(value) is not int or value not in (8000, 16000):
+                raise ValueError("Ungültiges Kontextbudget")
+        elif key == "llm_timeout":
+            if type(value) is not int or not 5 <= value <= 120:
+                raise ValueError("Ungültiges LLM-Zeitlimit")
+        elif not isinstance(value, str) or len(value) > MAX_TEXT:
+            raise ValueError("Ungültige Einstellungen")
 
     def policy(self):
         return ActionPolicy(self.hass, self.overrides)
@@ -315,18 +352,24 @@ class Bridge:
 
         return self.sanitize_diagnostics({"method": "POST", "endpoint": endpoint, "body": body}, url=url if endpoint else "")
 
-    def sanitize_diagnostics(self, value, *, url=""):
+    def sanitize_diagnostics(self, value, *, url="", token=""):
         if isinstance(value, dict):
-            return {key: self.sanitize_diagnostics(item, url=url) for key, item in value.items()}
+            return {key: self.sanitize_diagnostics(item, url=url, token=token) for key, item in value.items()}
         if isinstance(value, list):
-            return [self.sanitize_diagnostics(item, url=url) for item in value]
-        return self.redact(value, url=url, limit=None) if isinstance(value, str) else value
+            return [self.sanitize_diagnostics(item, url=url, token=token) for item in value]
+        return self.redact(value, url=url, token=token, limit=None) if isinstance(value, str) else value
 
     async def provider_json(self, method, url, token, *, payload=None, form=None):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         session = async_get_clientsession(self.hass)
+        timeout = 15 if method == "GET" else self.settings["llm_timeout"] if payload is not None else 60
+        if payload is not None:
+            form_data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+            headers["Content-Type"] = "application/json"
+        else:
+            form_data = form
         try:
-            async with session.request(method, url, json=payload, data=form, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15 if method == "GET" else 60)) as response:
+            async with session.request(method, url, data=form_data, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 raw = bytearray()
                 async for chunk in response.content.iter_chunked(65536):
                     raw.extend(chunk)
@@ -356,7 +399,7 @@ class Bridge:
                     detail = diagnostic(error) if isinstance(error, json.JSONDecodeError) else "Ungültiges JSON in der Anbieterantwort."
                     raise InvalidProviderResponse(detail) from None
         except TimeoutError:
-            raise AuralisError("Zeitüberschreitung beim API-Anbieter.") from None
+            raise ProviderTimeout("Zeitüberschreitung beim API-Anbieter.") from None
         except aiohttp.ClientError as error:
             raise AuralisError(f"Verbindung zum API-Anbieter fehlgeschlagen ({type(error).__name__}).") from None
 
@@ -382,13 +425,23 @@ class Bridge:
         except Exception as error:
             raise AuralisError(diagnostic(error)) from None
 
-    async def timed_request(self, kind, details, origin, *, sequence=1, form_fields=None, expected_tools=(), **kwargs):
+    async def warm_model(self):
+        started = time.perf_counter()
+        payload = {"model": self.settings["llm_model"], "messages": [{"role": "user", "content": "OK"}], "max_tokens": 1}
+        if (effort := REASONING_EFFORT[self.settings["llm_reasoning"]]) is not None:
+            payload["reasoning_effort"] = effort
+        response = await self.request("llm", payload=payload)
+        if not isinstance(response, dict) or not response.get("choices"):
+            raise InvalidProviderResponse("Das Modell hat keine Nachricht zurückgegeben.")
+        return {"duration_ms": elapsed_ms(started)}
+
+    async def timed_request(self, kind, details, origin, *, sequence=1, form_fields=None, expected_tools=(), expected_schemas=None, **kwargs):
         started = time.perf_counter()
         request = {"started_ms": round((started - origin) * 1000), "sequence": sequence}
         body = kwargs.get("payload", form_fields)
         if kind == "llm":
             offered = body.get("tools", [])
-            if not _check_tools(offered, expected_tools):
+            if not _check_tools(offered, expected_tools) or expected_schemas is not None and offered != expected_schemas:
                 details["action_outcome"] = "required_tools_missing"
                 raise AuralisError("Die HTTP-Anfrage enthält nicht die erwarteten Werkzeuge. Nichts wurde geändert.")
             request.update(offered_tools=bool(offered), tool_names=list(expected_tools), tool_count=len(offered),
@@ -412,7 +465,8 @@ class Bridge:
             if isinstance(error, ProviderRejected):
                 request["http_status"] = error.status
             if kind == "llm":
-                outcome = "provider_rejected" if isinstance(error, ProviderRejected) else "model_invalid_response" if isinstance(error, InvalidProviderResponse) else "provider_failed"
+                outcome = ("provider_rejected" if isinstance(error, ProviderRejected) else "model_invalid_response" if isinstance(error, InvalidProviderResponse)
+                           else "provider_timeout" if isinstance(error, ProviderTimeout) else "provider_failed")
                 details["action_outcome"] = outcome
                 if request["tool_count"]:
                     request["tool_delivery"] = {"provider_rejected": "provider_rejected", "model_invalid_response": "sent"}.get(outcome, "unconfirmed")
@@ -458,33 +512,67 @@ class Bridge:
         details.update(model=self.redact(self.settings["llm_model"]), language=(language or "")[:35], requests=[], action_outcome="no_executable_action")
         results = []
         memory_key = None if dry_run else memory_key
-        history_input = self.redact(prompt[:MAX_TEXT], url=self.settings["llm_url"], limit=None) if isinstance(prompt, str) else ""
+        original_url, original_token = self.settings["llm_url"], self.settings["llm_token"]
+        history_input = self.redact(prompt[:MAX_TEXT], url=original_url, token=original_token, limit=None) if isinstance(prompt, str) else ""
 
         def sanitize_history():
-            url = self.settings["llm_url"]
-            details.update(self.sanitize_diagnostics(details, url=url))
-            results[:] = self.sanitize_diagnostics(results, url=url)
+            details.update(self.sanitize_diagnostics(details, url=original_url, token=original_token))
+            results[:] = self.sanitize_diagnostics(results, url=original_url, token=original_token)
+
+        async def record_chat(**fields):
+            try:
+                await self.record("llm", dry_run, input=history_input, tools=results, diagnostics=details, **fields)
+            except Exception as error:
+                _LOGGER.warning("Auralis could not save diagnostics (%s)", type(error).__name__)
 
         async def finish(answer):
             details["duration_ms"] = elapsed_ms(started)
             sanitize_history()
-            answer = self.redact(answer, url=self.settings["llm_url"], limit=MAX_TEXT)
-            await self.record("llm", dry_run, input=history_input, answer=answer, tools=results, diagnostics=details)
+            answer = self.redact(answer, url=original_url, token=original_token, limit=MAX_TEXT)
+            await record_chat(answer=answer)
             return {"answer": answer, "tools": results, "diagnostics": details}
+
+        async def live_user():
+            user_id = getattr(context, "user_id", None)
+            if user_id is None:
+                return user, bool(user is not None and hasattr(context, "user_id"))
+            current = await self.hass.auth.async_get_user(user_id)
+            return current, not (current and current.id == user_id and current.is_active)
+
+        def location(policy):
+            return policy.voice_location(*voice_origin, self.settings["voice_room_overrides"]) if voice_origin is not None else None
 
         try:
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_TEXT:
                 raise AuralisError("Eine Eingabe mit 1 bis 16.000 Zeichen ist erforderlich.")
             selection_started = time.perf_counter()
             policy = self.policy()
+            user, invalid_user = await live_user()
+            english = (language or "").lower().startswith("en")
+            if invalid_user:
+                details["action_outcome"] = "user_not_authorized"
+                return await finish("You are not authorized. Nothing was changed." if english else "Du bist nicht berechtigt. Nichts wurde geändert.")
+            origin = location(policy)
+            origin_key = None
+            if origin is not None:
+                details["voice_origin"] = origin
+                origin_key = tuple(origin.get(key) for key in ("device_id", "satellite_id", "area_id", "source"))
+            unverified_voice = origin is not None and user is None and not origin["verified"]
+            if unverified_voice and memory_key:
+                self.memory.forget(memory_key)
+                memory_key = None
             timings = details["local_timings_ms"] = {}
             catalog_started = time.perf_counter()
             catalog = policy.catalog(user=user, for_retrieval=True, trace=timings)
             timings["catalog_total_ms"] = (time.perf_counter() - catalog_started) * 1000
             resolver_started = time.perf_counter()
-            remembered = self.memory.context(memory_key, catalog) if memory_key else None
+            remembered = self.memory.context(memory_key, catalog, origin=origin_key) if memory_key else None
             pending = remembered.pending if remembered else None
-            english = (language or "").lower().startswith("en")
+            resolve_options = {"comfort": self.settings["llm_light_comfort"] is True, "timings": timings,
+                               "voice_area": origin["area_id"] if origin else None, "voice_request": origin is not None,
+                               "previous_action": remembered.action if remembered else None}
+            reference = remembered.ids if remembered else ()
+            original_prompt = prompt
             correction = None
             if remembered and remembered.correction and normalize(prompt) in {"nein die andere", "nein der andere", "no the other one", "no the other"}:
                 correction = remembered.correction
@@ -501,7 +589,7 @@ class Bridge:
                     return await finish("Cancelled. Nothing was changed." if english else "Abgebrochen. Nichts wurde geändert.")
                 if ordinal is None:
                     return await finish("Say first, second, or cancel. Nothing was changed." if english else "Sag erste, zweite oder abbrechen. Nichts wurde geändert.")
-                fresh = resolve(pending.prompt, catalog, pending.language, comfort=self.settings["llm_light_comfort"] is True, timings=timings)
+                fresh = resolve(pending.prompt, catalog, pending.language, **resolve_options)
                 choices = target_alternatives(pending.prompt, catalog, pending.language, fresh) if pending.kind == "target" else fresh.choices
                 if len(choices) != 2 or _signatures(choices, fresh.entities) != pending.signatures:
                     self.memory.forget(memory_key)
@@ -512,9 +600,7 @@ class Bridge:
                 correction = (pending, ordinal) if pending.kind == "target" else None
                 prompt = ("Approve the selected option: " if english else "Bestätige die gewählte Option: ") + json.dumps(selected.diagnostic(), ensure_ascii=False)
             else:
-                voice_area = policy.voice_area_id(*voice_origin) if voice_origin and any(voice_origin) else None
-                resolved = resolve(prompt, catalog, language, remembered.ids if remembered else (), comfort=self.settings["llm_light_comfort"] is True,
-                                   timings=timings, voice_area=voice_area, previous_action=remembered.action if remembered else None)
+                resolved = resolve(prompt, catalog, language, reference, **resolve_options)
             timings["resolver_total_ms"] = (time.perf_counter() - resolver_started) * 1000
             candidates, enabled, bulk_targets, selection, steps, matches = resolved.entities, resolved.enabled, resolved.bulk, resolved.status, resolved.steps, resolved.trace
             mode = resolved.mode
@@ -529,21 +615,26 @@ class Bridge:
             bound_options = {key: ExecutableStep.bind(step) for key, step in bounded.items()}
             if memory_key and selection not in {"read_only", "no_match"}:
                 self.memory.forget(memory_key)
-            inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates]
+            inventory = [{key: entity[key] for key in ("id", "name", "area", "state", "count") if key in entity} for entity in candidates if not unverified_voice and entity.get("exposed", True)]
             details["selection_ms"] = elapsed_ms(selection_started)
             details["selection_started_ms"] = round((selection_started - started) * 1000)
-            details["selection"] = {"status": selection, "mode": "all" if self.settings["llm_full_context"] else "filtered", "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets, "matched_scope": matches.pop("scope", []), "plan": [step.diagnostic() for step in steps]}
+            details["selection"] = {"status": selection, "mode": "all" if self.settings["llm_full_context"] and not unverified_voice else "filtered", "matches": matches, "entities": inventory, "action_parameters": enabled, "resolved_targets": bulk_targets, "matched_scope": matches.pop("scope", []), "plan": [step.diagnostic() for step in steps]}
             details["selection"].update(resolution_mode=mode.value, candidates=[choice.diagnostic() for choice in resolved.choices])
+            if unverified_voice and (steps or bounded or selection == "already_set"):
+                details["action_outcome"] = "unverified_voice_input"
+                return await finish("I couldn't identify this voice input. Nothing was changed." if english else "Ich konnte das Sprachgerät nicht zuordnen. Nichts wurde geändert.")
+            if matches.get("reason") == "unknown_voice_area":
+                return await finish("Which room do you mean? This voice input has no clear room." if english else "Welchen Raum meinst du? Dieses Sprachgerät ist keinem eindeutigen Raum zugeordnet.")
             if selection == "no_action" or matches.get("rejected_actions") or any(clause.get("status") == "no_action" for clause in matches.get("clauses", [])):
                 details["action_outcome"] = "capability_or_policy_rejected"
             if memory_key and not pending and len(prompt) <= 512 and mode is ResolutionMode.CLARIFICATION:
                 alternatives = target_alternatives(prompt, catalog, language, resolved)
-                if alternatives:
+                if alternatives and all(entity.get("exposed", True) for entity in candidates):
                     by_id = {entity["id"]: entity for entity in candidates}
                     ordered = [by_id[choice.action.targets[0]] for choice in alternatives]
                     labels = [f"{entity['name']} ({entity['area']})" if entity["area"] else entity["name"] for entity in ordered]
                     self.memory.remember(memory_key, [entity["id"] for entity in ordered], catalog, source="clarification",
-                                         pending=PendingChoice(prompt, language, _signatures(alternatives, candidates), "target"))
+                                         pending=PendingChoice(prompt, language, _signatures(alternatives, candidates), "target"), origin=origin_key)
                     details["selection"]["clarification_choices"] = inventory
                     return await finish(f"First: {labels[0]}, or second: {labels[1]}?" if english else f"Erste: {labels[0]}, oder zweite: {labels[1]}?")
             if selection == "already_set":
@@ -554,25 +645,170 @@ class Bridge:
                 suffix = (" Some targets were not authorized." if english else " Einige Ziele waren nicht freigegeben.") if missed else ""
                 if memory_key and not missed:
                     targets = [item["id"] for item in scope if item["status"] == "already_set"] if scope else [target["id"]]
-                    self.memory.remember(memory_key, targets, catalog)
+                    self.memory.remember(memory_key, targets, catalog, origin=origin_key)
                 state = target["state"]
                 plural = target.get("count", 1) > 1
-                nonlight = target["id"] == BULK_TARGET and details["selection"]["matched_scope"] and not details["selection"]["matched_scope"][0]["id"].startswith("light.")
+                nonlight = matches.get("room_everything") or target["id"] == BULK_TARGET and scope and not scope[0]["id"].startswith("light.")
                 if nonlight:
                     return await finish((("The devices are already " + state + ".") if english else ("Die Geräte sind schon " + ("an." if state == "on" else "aus."))) + suffix)
                 if english:
                     return await finish((f"The lights are already {state}." if plural else f"The light is already {state}.") + suffix)
                 return await finish(f"{'Die Lampen sind' if plural else 'Die Lampe ist'} schon {'an' if state == 'on' else 'aus'}." + suffix)
+            async def execute(executable):
+                preflight_started = time.perf_counter()
+                details["action_outcome"] = "preflight_rejected"
+                policy = self.policy()
+
+                def reject_preflight(reason):
+                    details["selection"]["preflight_failed"] = reason
+                    timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
+
+                area = matches.get("target_area")
+                area_targets = {target for step in executable for root, leaves in step.bindings for target in (root, *leaves)}
+                area_groups = {root for step in executable for root, leaves in step.bindings if leaves != (root,)}
+                observed = {entity["id"]: entity for entity in catalog if entity["id"] in area_targets and (entity.get("registry_id") or "scene_scope" in entity)}
+                observed_areas = {entity["id"]: entity["area_id"] for entity in catalog if entity["id"] in area_targets and entity.get("area_id")}
+                check_each_area = not area and any(clause.get("rooms") for clause in matches.get("clauses", [matches]))
+
+                async def guard(leaf=None, roots=(), *, step=None):
+                    current, invalid_user = await live_user()
+                    if invalid_user:
+                        return current, "user_not_authorized"
+                    if origin is not None:
+                        updated_origin = location(policy)
+                        if current is None and not updated_origin["verified"]:
+                            return current, "unverified_voice_input"
+                        if origin.get("device_id") != updated_origin.get("device_id"):
+                            return current, "voice_input_changed"
+                        if matches.get("voice_area") and updated_origin["area_id"] != area:
+                            return current, "voice_area_changed"
+                    if area and (any(not policy.in_area(target, area) for target in ((leaf, *roots) if leaf else area_targets))
+                                 or leaf is None and any(not policy.room_group_ok(target, area) for target in area_groups)):
+                        return current, "voice_area_changed"
+                    for target in ((leaf, *roots) if leaf else observed):
+                        item = observed.get(target, {})
+                        if (item.get("registry_id") and policy.identity(target) != item["registry_id"]
+                            or "scene_scope" in item and policy.scene_scope(target) != item["scene_scope"]):
+                            return current, "target_identity_or_scene_scope_changed"
+                    if check_each_area and any(target in observed_areas and not policy.in_area(target, observed_areas[target])
+                                               for target in ((leaf, *roots) if leaf else observed_areas)):
+                        return current, "voice_area_changed"
+                    if step and step.state_basis and not policy.basis_matches(step.targets[0], step.state_basis):
+                        return current, "live_value_changed"
+                    if matches.get("intent_source") == "configured_light_comfort" and self.settings["llm_light_comfort"] is not True:
+                        return current, "comfort_disabled"
+                    if local_path and self.settings["local_fast_path"] is not True:
+                        return current, "local_fast_path_disabled"
+                    return current, None
+
+                current_user, failure = await guard()
+                if failure:
+                    reject_preflight(failure)
+                    if failure == "voice_area_changed":
+                        return await finish("The room changed. Nothing was changed." if english else "Der Raum hat sich geändert. Nichts wurde geändert.")
+                    return await finish("The request is no longer authorized. Nothing was changed." if english else "Die Anfrage ist nicht mehr freigegeben. Nichts wurde geändert.")
+                if area and (matches.get("voice_area") or bulk_targets) and not pending and not bounded and (details["requests"] or current_user is not None):
+                    fresh_catalog = policy.catalog(user=current_user, for_retrieval=True, area_id=area)
+                    fresh = resolve(original_prompt, fresh_catalog, language, reference, **(resolve_options | {"timings": None}))
+                    if tuple(ExecutableStep.bind(step) for step in fresh.steps) != executable or fresh.trace.get("scope", []) != details["selection"]["matched_scope"]:
+                        reject_preflight("room_scope_changed")
+                        return await finish("The room's targets changed. Nothing was changed." if english else "Die Geräteauswahl im Raum hat sich geändert. Nichts wurde geändert.")
+                for step in executable:
+                    if step.state_basis and not policy.basis_matches(step.targets[0], step.state_basis):
+                        reject_preflight("live_value_changed")
+                        return await finish("The device state changed. Nothing was changed." if english else "Der Gerätezustand hat sich geändert. Nichts wurde geändert.")
+                    for targets, leaves in _batches(step):
+                        checked = policy.preflight(step.action, targets, step.parameters, context, user=current_user, expected_leaves=leaves)
+                        if _failed(checked):
+                            reject_preflight(checked)
+                            return await finish("The targets are no longer available or authorized. Nothing was changed." if english else "Die Ziele sind nicht mehr verfügbar oder freigegeben. Nichts wurde geändert.")
+
+                details["selection"]["preflight_passed"] = True
+                timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
+                execution_started = time.perf_counter()
+                details["action_outcome"] = "execution_failed"
+                stopped = False
+                for step in executable:
+                    tool_started = time.perf_counter()
+                    action, ids, params = step.action, step.targets, step.parameters
+                    result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
+                    if stopped:
+                        result["skipped"] = [{"entity_id": target, "reason": "earlier action failed"} for target in ids]
+                    elif step.state_basis and not policy.basis_matches(ids[0], step.state_basis):
+                        stopped = True
+                        result["errors"] = [{"entity_id": ids[0], "reason": "live value changed"}]
+                    else:
+                        for targets, leaves in _batches(step):
+                            try:
+                                batch = await policy.run(action, targets, params, context, dry_run=dry_run, user=current_user, expected_leaves=leaves, guard=partial(guard, step=step))
+                            except Exception:
+                                batch = {"executed": [], "planned": [], "skipped": [], "errors": [{"entity_id": targets[0], "reason": "execution could not be verified"}]}
+                            for key in result:
+                                result[key].extend(batch[key])
+                            if _failed(batch):
+                                stopped = True
+                                result["skipped"].extend({"entity_id": target, "reason": "earlier batch failed"} for target in ids[ids.index(targets[-1]) + 1:])
+                                break
+                    if len(executable) == 1:
+                        result["skipped"].extend({"entity_id": item["id"], "reason": "not in the permitted scope"} for item in details["selection"]["matched_scope"] if item["status"] == "not_allowed")
+                    logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
+                    results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "sequence":1 + len(details["requests"]) + len(results), "started_ms":round((tool_started - started) * 1000), "duration_ms":elapsed_ms(tool_started)})
+                timings["execution_ms"] = (time.perf_counter() - execution_started) * 1000
+                count = sum(len(item["result"]["planned" if dry_run else "executed"]) for item in results)
+                missed = any(_failed(item["result"]) for item in results)
+                if count and missed:
+                    details["action_outcome"] = "dry_run_partial" if dry_run else "partial_failure"
+                elif count:
+                    details["action_outcome"] = "dry_run_validated" if dry_run else "executed"
+                if memory_key and count and not missed:
+                    last = executable[-1]
+                    self.memory.remember(memory_key, last.scope, catalog, source="executed", action=last.action, parameters=last.parameters, correction=correction, origin=origin_key)
+                if prepared and (count or dry_run):
+                    return await finish(switch_response(action, result, dry_run=dry_run, english=english))
+                if not count and not dry_run:
+                    answer = ("I couldn't confirm the change. A device may not have responded." if english else "Ich konnte die Änderung nicht bestätigen. Ein Gerät antwortet möglicherweise nicht.")
+                elif not dry_run and not missed and len(executable) == 1 and action in {"turn_on", "turn_off"} and all(target.startswith("light.") for target in ids):
+                    answer = switch_response(action, result, dry_run=False, english=english)
+                elif not dry_run and not missed and len(executable) == 1 and action == "light_set":
+                    if set(params) == {"rgb_color"}:
+                        answer = "Color set." if english else "Farbe eingestellt."
+                    elif set(params) <= {"brightness", "brightness_pct"}:
+                        answer = "Brightness set." if english else "Helligkeit eingestellt."
+                    else:
+                        answer = "Lighting adjusted." if english else "Licht eingestellt."
+                elif english:
+                    answer = f"{count} device {'operation' if count == 1 else 'operations'} {'planned' if dry_run else 'completed'}." + (" Some operations could not be completed." if missed else "")
+                else:
+                    answer = f"{count} {'Geräteaktion' if count == 1 else 'Geräteaktionen'} {'geplant' if dry_run else 'ausgeführt'}." + (" Einige Aktionen waren nicht möglich." if missed else "")
+                return await finish(answer)
+
+            clauses = matches.get("clauses", [matches])
+            local_path = (self.settings["local_fast_path"] is True and bool(executable) and not pending and not matches.get("excluded")
+                          and not matches.get("room_everything") and (not bulk_targets or bool(matches.get("target_area")))
+                          and not any(item["status"] == "not_allowed" for item in details["selection"]["matched_scope"])
+                          and all(step.action in {"turn_on", "turn_off", "light_set"} and not step.state_basis
+                                  and all(target.startswith("light.") and leaves == (target,) for target, leaves in step.bindings) for step in executable)
+                          and all((clause.get("names") or clause.get("rooms") or matches.get("target_area") or index and clause.get("reference"))
+                                  and (index or not clause.get("reference"))
+                                  and all(evidence["method"] in {"exact", "word_join"} for field in ("names", "rooms") for evidence in clause.get(field, []))
+                                  for index, clause in enumerate(clauses)))
+            prepared = None
+            if local_path:
+                details["confirmation"] = {"state": "local_fast_path"}
+                details["selection"]["strategy"] = "local_fast_path"
+                return await execute(executable)
+
             allowed_ids = [entity["id"] for entity in inventory] if enabled else []
-            full_mode = self.settings["llm_full_context"]
+            full_mode = self.settings["llm_full_context"] and not unverified_voice
             catalog_inventory = []
             if full_mode:
                 for entity in catalog:
+                    if matches.get("target_area") and entity.get("area_id") != matches["target_area"]:
+                        continue
                     actions = {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True}
                     if not actions:
                         continue
                     catalog_inventory.append({key: entity[key] for key in ("id", "name", "area", "state") if key in entity} | {"actions": actions})
-            prepared = None
             if not single_plan and not adaptive and len(enabled) == 1 and len(candidates) == 1:
                 candidate = candidates[0]
                 action = next(iter(enabled))
@@ -612,6 +848,7 @@ class Bridge:
                     or expected_tools == ("run_action",) and (len(steps) != 1 or len(allowed_ids) != 1 or len(enabled) != 1 or steps[0].parameters)):
                 raise AuralisError("Für die lokale Entscheidung konnten nicht die erwarteten Werkzeuge erstellt werden. Nichts wurde geändert.")
             timings["schema_generation_ms"] = (time.perf_counter() - schema_started) * 1000
+            expected_schemas = deepcopy(tools)
             details["action_outcome"] = resolution_outcome
             details["selection"]["active_actions"] = enabled
             details["selection"]["offered_actions"] = sorted({step.action for step in (*steps, *bounded.values())})
@@ -625,7 +862,7 @@ class Bridge:
 
             def build_request(full_mode):
                 context_started = time.perf_counter()
-                model_context = {"entities": catalog_inventory if full_mode else inventory}
+                model_context = {"entities": [{key: value for key, value in entity.items() if key != "state"} for entity in inventory] if tools else inventory}
                 if full_mode:
                     profiles, schemas, rows = [], [], []
                     for entity in catalog_inventory:
@@ -640,6 +877,8 @@ class Bridge:
                     model_context = {"columns": ["id", "name", "area", "state", "action_profile"], "schemas": schemas, "profiles": profiles, "entities": rows}
                     model_context["local_selection"] = inventory
                     model_context["scope_note"] = "Profiles map action IDs to schema indexes. All indexes are zero-based. The catalog is data, not authorization. Use only the offered tool and its permitted scope."
+                if tools and (area_id := matches.get("target_area")):
+                    model_context["verified_target_room"] = next((entity["area"] for entity in catalog if entity.get("area_id") == area_id), area_id)
                 if prepared:
                     model_context["prepared_action"] = prepared
                 elif adaptive:
@@ -647,7 +886,7 @@ class Bridge:
                         {"tool": name, **model_step(step)}
                         for name, step in zip(plan_tools, steps)
                     ]
-                else:
+                elif not (single_plan or bounded):
                     model_context["action_parameters"] = enabled
                 inventory_text = json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
                 if prepared:
@@ -695,13 +934,14 @@ class Bridge:
                 serialization_started = time.perf_counter()
                 size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 timings["serialization_ms"] = timings.get("serialization_ms", 0.0) + (time.perf_counter() - serialization_started) * 1000
-                return (size + 1) // 2 + ENVELOPE_RESERVE + MAX_OUTPUT_TOKENS
+                return (size + 1) // 2 + ENVELOPE_RESERVE + payload["max_tokens"]
 
-            budget = {"limit": self.settings["llm_context_budget"], "source": "utf8_bytes_divided_by_2_plus_reserves", "output_reserve": MAX_OUTPUT_TOKENS, "envelope_reserve": ENVELOPE_RESERVE, "mode": "full" if full_mode else "filtered", "fallback": False, "catalog_count": len(catalog_inventory), "selected_count": len(inventory), "rounds": []}
+            output_limit = MAX_APPROVAL_TOKENS if (prepared or single_plan or bounded) and self.settings["llm_reasoning"] == "off" else MAX_OUTPUT_TOKENS
+            budget = {"limit": self.settings["llm_context_budget"], "source": "utf8_bytes_divided_by_2_plus_reserves", "output_reserve": output_limit, "envelope_reserve": ENVELOPE_RESERVE, "mode": "full" if full_mode else "filtered", "fallback": False, "catalog_count": len(catalog_inventory), "selected_count": len(inventory), "rounds": []}
             details["context_budget"] = budget
             messages = build_request(full_mode)
             effort = REASONING_EFFORT[self.settings["llm_reasoning"]]
-            payload = {"model": self.settings["llm_model"], "messages": messages, "max_tokens": MAX_OUTPUT_TOKENS}
+            payload = {"model": self.settings["llm_model"], "messages": messages, "max_tokens": output_limit}
             if effort is not None:
                 payload["reasoning_effort"] = effort
             if tools:
@@ -720,7 +960,7 @@ class Bridge:
                 budget["overflow"] = estimated - budget["limit"]
                 details["action_outcome"] = "context_budget_exceeded"
                 raise AuralisError("LLM-Kontextbudget überschritten; Anfrage oder Geräteauswahl ist zu groß.")
-            data = await self.timed_request("llm", details, started, payload=payload, expected_tools=expected_tools)
+            data = await self.timed_request("llm", details, started, payload=payload, expected_tools=expected_tools, expected_schemas=expected_schemas)
             validation_started = time.perf_counter()
             request = details["requests"][-1]
             choices = data.get("choices") if isinstance(data, dict) else None
@@ -747,9 +987,9 @@ class Bridge:
                 raise AuralisError("Das Modell hat das Ausgabelimit erreicht. In dieser Runde wurde keine Aktion ausgeführt.")
             invalid = "Die Anbieterantwort enthält einen ungültigen oder nicht freigegebenen Werkzeugaufruf."
             expected_calls = 1 if single_plan or bounded else len(steps)
-            if (reason not in (None, "stop", "tool_calls") or not isinstance(calls, list)
+            if (reason not in (None, "stop", "tool_calls") or not isinstance(calls, list) or msg.get("role") not in (None, "assistant")
                     or reason == "tool_calls" and not calls
-                    or calls and (msg.get("refusal") or not payload.get("tools") or len(calls) != expected_calls or len(calls) > MAX_STEPS
+                    or calls and (msg.get("refusal") not in (None, "") or msg.get("function_call") is not None or not payload.get("tools") or len(calls) != expected_calls or len(calls) > MAX_STEPS
                                   or not all(isinstance(call, dict) and isinstance(call.get("id"), str) and 0 < len(call["id"]) <= 256 and call["id"].strip() for call in calls)
                                   or len({call["id"] for call in calls}) != len(calls))):
                 details["action_outcome"] = "model_invalid_tool_calls"
@@ -779,7 +1019,7 @@ class Bridge:
                 if bounded:
                     if memory_key:
                         self.memory.remember(memory_key, resolved.entities and [resolved.entities[0]["id"]], catalog,
-                                             source="clarification", pending=PendingChoice(prompt, language, _signatures(resolved.choices, resolved.entities)))
+                                             source="clarification", pending=PendingChoice(prompt, language, _signatures(resolved.choices, resolved.entities)), origin=origin_key)
                     if matches.get("intent_source") == "configured_light_comfort":
                         return await finish("First: brightness to 30 percent, or second: warm white?" if english else "Erste: Helligkeit auf 30 Prozent, oder zweite: Warmweiß?")
                     return await finish("The first or the second action? Nothing was changed." if english else "Die erste oder die zweite Aktion? Nichts wurde geändert.")
@@ -789,6 +1029,10 @@ class Bridge:
                     return await finish("Please clarify the targets or action. Nothing was changed." if english else "Bitte sag genauer, welche Geräte oder Aktion du meinst. Nichts wurde geändert.")
                 if selection == "no_action":
                     return await finish("The requested action isn't supported or allowed for that target." if english else "Diese Aktion wird für das Ziel nicht unterstützt oder ist nicht freigegeben.")
+                if selection == "read_only" and matches.get("action_hints") and not _QUESTION.search(normalize(prompt)):
+                    return await finish("Nothing was changed." if english else "Nichts wurde geändert.")
+                if _VERB.search(normalize(prompt)) and not _QUESTION.search(normalize(prompt)):
+                    return await finish("I didn't recognize an authorized action. Nothing was changed." if english else "Ich habe keine freigegebene Aktion erkannt. Nichts wurde geändert.")
                 content = msg.get("content") or ""
                 if reasoning and isinstance(content, str):
                     content = content.lstrip().removeprefix(reasoning)
@@ -816,79 +1060,11 @@ class Bridge:
 
             details["selection"]["parameters_validated"] = True
             timings["model_validation_ms"] = (time.perf_counter() - validation_started) * 1000
-            preflight_started = time.perf_counter()
-            details["action_outcome"] = "preflight_rejected"
-            policy = self.policy()
-
-            def reject_preflight(reason):
-                details["selection"]["preflight_failed"] = reason
-                timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
-
-            if area := matches.get("voice_area"):
-                if policy.voice_area_id(*voice_origin) != area or any(getattr(policy._area(target), "id", None) != area for step in executable for target in step.targets):
-                    reject_preflight("voice_area_changed")
-                    return await finish("The room changed. Nothing was changed." if english else "Der Raum hat sich geändert. Nichts wurde geändert.")
-            if matches.get("intent_source") == "configured_light_comfort" and self.settings["llm_light_comfort"] is not True:
-                reject_preflight("comfort_disabled")
-                return await finish("That interpretation is no longer enabled. Nothing was changed." if english else "Diese Auslegung ist nicht mehr aktiviert. Nichts wurde geändert.")
-            for step in executable:
-                if step.state_basis and not policy.basis_matches(step.targets[0], step.state_basis):
-                    reject_preflight("live_value_changed")
-                    return await finish("The device state changed. Nothing was changed." if english else "Der Gerätezustand hat sich geändert. Nichts wurde geändert.")
-                for targets, leaves in _batches(step):
-                    checked = policy.preflight(step.action, targets, step.parameters, context, user=user, expected_leaves=leaves)
-                    if _failed(checked):
-                        reject_preflight(checked)
-                        return await finish("The targets are no longer available or authorized. Nothing was changed." if english else "Die Ziele sind nicht mehr verfügbar oder freigegeben. Nichts wurde geändert.")
-
-            details["selection"]["preflight_passed"] = True
-            timings["preflight_ms"] = (time.perf_counter() - preflight_started) * 1000
-            execution_started = time.perf_counter()
-            details["action_outcome"] = "execution_failed"
-            stopped = False
-            for step in executable:
-                tool_started = time.perf_counter()
-                action, ids, params = step.action, step.targets, step.parameters
-                result = {key: [] for key in ("executed", "planned", "skipped", "errors")}
-                if stopped:
-                    result["skipped"] = [{"entity_id": target, "reason": "earlier action failed"} for target in ids]
-                elif step.state_basis and not policy.basis_matches(ids[0], step.state_basis):
-                    stopped = True
-                    result["errors"] = [{"entity_id": ids[0], "reason": "live value changed"}]
-                else:
-                    for targets, leaves in _batches(step):
-                        batch = await policy.run(action, targets, params, context, dry_run=dry_run, user=user, expected_leaves=leaves)
-                        for key in result:
-                            result[key].extend(batch[key])
-                        if _failed(batch):
-                            stopped = True
-                            result["skipped"].extend({"entity_id": target, "reason": "earlier batch failed"} for target in ids[ids.index(targets[-1]) + 1:])
-                            break
-                if len(executable) == 1:
-                    result["skipped"].extend({"entity_id": item["id"], "reason": "not in the permitted scope"} for item in details["selection"]["matched_scope"] if item["status"] == "not_allowed")
-                logged_result = result | {"errors": [error | {"detail": self.redact(error["detail"])} if "detail" in error else error for error in result.get("errors", [])]}
-                results.append({"action":action, "entity_ids":ids, "parameters":params, "result":logged_result, "sequence":1 + len(details["requests"]) + len(results), "started_ms":round((tool_started - started) * 1000), "duration_ms":elapsed_ms(tool_started)})
-            timings["execution_ms"] = (time.perf_counter() - execution_started) * 1000
-            count = sum(len(item["result"]["planned" if dry_run else "executed"]) for item in results)
-            missed = any(_failed(item["result"]) for item in results)
-            if count and missed:
-                details["action_outcome"] = "dry_run_partial" if dry_run else "partial_failure"
-            elif count:
-                details["action_outcome"] = "dry_run_validated" if dry_run else "executed"
-            if memory_key and not missed:
-                last = executable[-1]
-                self.memory.remember(memory_key, last.scope, catalog, source="executed", action=last.action, parameters=last.parameters, correction=correction)
-            if prepared:
-                return await finish(switch_response(action, result, dry_run=dry_run, english=english))
-            if english:
-                answer = f"{count} device {'operation' if count == 1 else 'operations'} {'planned' if dry_run else 'completed'}." + (" Some operations could not be completed." if missed else "")
-            else:
-                answer = f"{count} {'Geräteaktion' if count == 1 else 'Geräteaktionen'} {'geplant' if dry_run else 'ausgeführt'}." + (" Einige Aktionen waren nicht möglich." if missed else "")
-            return await finish(answer)
+            return await execute(executable)
         except Exception as error:
-            detail = self.redact(diagnostic(error))
+            detail = self.redact(diagnostic(error), url=original_url, token=original_token)
             details["error"] = detail
             details["duration_ms"] = elapsed_ms(started)
             sanitize_history()
-            await self.record("llm", dry_run, input=history_input, tools=results, error=detail, diagnostics=details)
+            await record_chat(error=detail)
             raise AuralisError(detail) from None

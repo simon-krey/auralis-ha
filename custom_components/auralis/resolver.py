@@ -6,8 +6,8 @@ import re
 from time import perf_counter
 
 from .actions import _ACTIONS, power_permission, shared_parameters, valid_parameters
-from .names import contains, normalize
-from .retrieval import BULK_TARGET, _ACTION_PATTERNS, _DEFERRED, _EXCEPTION, _QUESTION, _TARGET_GRAMMAR, select_context
+from .names import EXPLICIT_LOCATION, contains, normalize, remove_location
+from .retrieval import BULK_TARGET, _ACTION_PATTERNS, _DEFERRED, _EXCEPTION, _GENERIC_LIGHT_SWITCH, _GLOBAL, _QUESTION, _TARGET_GRAMMAR, select_context
 from .voice_values import value_expression
 
 MAX_STEPS = 8
@@ -171,7 +171,7 @@ def _unknown_parameter_words(text):
     return set(text.split()) - _TARGET_GRAMMAR
 
 
-def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_noops=False, timings=None):
+def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_noops=False, timings=None, local_scope=False):
     trace = {}
     property_request = _COLOR_REQUEST.fullmatch(prompt.strip())
     if property_request:
@@ -209,6 +209,7 @@ def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_n
         catalog = [entity for entity in catalog if entity["id"] in reference]
         targets = " and ".join(entity["id"] for entity in catalog)
         if _PRONOUN.search(prompt):
+            prompt = re.sub(rf"\b({_REFERENCE_WORD})\s+(?:jetzt|now)\b", r"\1", prompt, count=1, flags=re.I)
             prompt = _PRONOUN.sub(targets, prompt, count=1)
         else:
             prompt = re.sub(r"^(?:(?:und|and) )?(?:jetzt |now )?(?=auf |to )", f"set {targets} ", prompt, flags=re.I)
@@ -216,7 +217,7 @@ def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_n
     prompt = re.sub(r"\s*,\s*(?:und|and)\s+", " and ", prompt, flags=re.I)
     prompt = re.sub(r"(?<!\d),|,(?!\d)", " and ", prompt)
     spoken = re.sub(r"(?<=\d)\s*%", " percent", prompt)
-    entities, enabled, bulk, status = select_context(spoken, catalog, trace=trace, language=language, strict=True, keep_noops=keep_noops, timings=timings)
+    entities, enabled, bulk, status = select_context(spoken, catalog, trace=trace, language=language, strict=True, keep_noops=keep_noops, timings=timings, local_scope=local_scope)
     if status != "matched":
         if status == "no_action" and re.search(r"\b(?:gemutlicher|gemuetlicher|gemutlich|gemuetlich|cosier|cozier)\b", text):
             return Resolution("clarify", entities, trace=trace | {"reason": "subjective_value_not_configured"})
@@ -251,6 +252,11 @@ def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_n
         return Resolution("clarify", entities, trace=trace | {"reason": "missing_ambiguous_or_unsupported_parameters"})
     members = {target: tuple(item.get("members", (target,))) for target, item in specs.items()}
     leaves = [leaf for group in members.values() for leaf in group]
+    room_ids = {room["id"] for room in trace.get("rooms", [])}
+    if len(room_ids) == 1:
+        room_members = {entity["id"] for entity in catalog if entity.get("area_id") in room_ids}
+        if room_members and (action == "activate" or not (set(targets) | set(leaves)) <= room_members):
+            return Resolution("clarify", entities, trace=trace | {"reason": "unverified_room_targets"})
     if len(leaves) != len(set(leaves)):
         return Resolution("clarify", entities, trace=trace | {"reason": "overlapping_group_targets"})
     if power := power_permission(action, parameters):
@@ -266,7 +272,7 @@ def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_n
     return Resolution(status, entities, enabled, bulk, [ActionCandidate(action, members, schema, parameters, scope, basis)], trace, adaptive)
 
 
-def _exclusion(prompt, catalog, language, reference, timings):
+def _exclusion(prompt, catalog, language, reference, timings, local_scope=False):
     leave = _LEAVE.search(prompt)
     marker = leave or _EXCLUSION.search(prompt)
     if not marker:
@@ -276,7 +282,7 @@ def _exclusion(prompt, catalog, language, reference, timings):
     if state and not leave:
         start += f" {state[1]}"
         end = end[:state.start()]
-    included = _part(start, catalog, language, reference, timings=timings)
+    included = _part(start, catalog, language, reference, timings=timings, local_scope=local_scope)
     blocked = Resolution("clarify", included.entities, trace=included.trace | {"reason": "unresolved_exclusion"})
     if len(included.steps) != 1 or not included.bulk and not leave:
         return blocked
@@ -316,7 +322,10 @@ def _exclusion(prompt, catalog, language, reference, timings):
 
 _ALTERNATIVES = re.compile(r"^(?:wahlweise|either) (.+) (?:oder|or) (.+)$", re.I)
 _COMFORT = re.compile(r"^(?:mach(?:e)?|make) (.+) (?:gemütlicher|gemuetlicher|cozier|cosier)[.!?]*$", re.I)
-_HERE_LIGHT = re.compile(r"(?:schalte?|mache?) (?:hier (?:das licht|die lampen|die lichter)|(?:das licht|die lampen|die lichter) hier) (an|ein|aus)|(?:turn|switch) (?:the )?lights (on|off) here")
+_HERE = re.compile(r"\b(?:hier|bei mir|in diesem (?:zimmer|raum)|here|in this room)\b", re.I)
+_LOCAL_OFF = re.compile(r"(?:bitte |please )?(?:(?:schalte?|mache?) alles aus|(?:turn|switch) (?:everything off|off everything))(?: bitte| please)?")
+_LOCAL_POWER_DOMAINS = {"light", "switch", "fan", "humidifier"}
+_EXPLICIT_ALL = re.compile(r"\b(?:alle[nrs]?|samtliche[nrs]?|all|every)\b")
 _REPEAT_LIGHT = re.compile(r"(?:und|and) ((?:die|das|the) (?:lampe|leuchte|licht|lamp|light) (?:im|in|in der|in the) .+?) (?:auch|too)[.!]*$", re.I)
 _CHOICE_ACTIONS = frozenset({"light_set", "turn_on", "turn_off", "fan_set_percentage", "volume_set"})
 
@@ -366,16 +375,102 @@ def target_alternatives(prompt, catalog, language, resolution):
     return tuple(choices)
 
 
-def resolve(prompt, catalog, language, reference=(), *, comfort=False, timings=None, voice_area=None, previous_action=None):
+def resolve(prompt, catalog, language, reference=(), *, comfort=False, timings=None, voice_area=None, voice_request=False, previous_action=None):
+    options = {"comfort": comfort, "timings": timings, "previous_action": previous_action}
+    marker = _HERE.search(prompt)
+    stripped = _HERE.sub(" ", prompt) if marker else prompt
+    normalized = normalize(stripped)
+    if marker and _GLOBAL.search(normalized):
+        return Resolution("clarify", [], trace={"reason": "conflicting_room_scope"})
+    everything_areas = set()
+    if re.search(r"\b(?:alles|everything)\b", normalized) and EXPLICIT_LOCATION.search(normalized):
+        for entity in catalog:
+            if entity.get("area_id") and any(_LOCAL_OFF.fullmatch(" ".join(remove_location(normalized, normalize(name)).split()))
+                                             for name in (entity["area"], *entity.get("area_aliases", ())) if name):
+                everything_areas.add(entity["area_id"])
+    if len(everything_areas) > 1:
+        return Resolution("clarify", [], trace={"reason": "conflicting_room_scope"})
+    if everything_areas:
+        return _room_everything(catalog, next(iter(everything_areas)))
+    if marker and EXPLICIT_LOCATION.search(normalized):
+        if any(_HERE.search(part) and not EXPLICIT_LOCATION.search(normalize(_HERE.sub(" ", part))) for part in _parts(prompt, catalog)):
+            return Resolution("clarify", [], trace={"reason": "conflicting_room_scope"})
+        resolved = _resolve(stripped, catalog, language, reference, **options)
+        clauses = resolved.trace.get("clauses", [resolved.trace])
+        rooms = {room["id"] for clause in clauses for room in clause.get("rooms", []) if room["method"] in {"exact", "word_join"}}
+        room_members = {entity["id"] for entity in catalog if entity.get("area_id") in rooms}
+        if len(rooms) != 1 or not room_members or not _room_bound(resolved, room_members):
+            return Resolution("clarify", [], trace=resolved.trace | {"reason": "conflicting_room_scope"})
+        resolved.trace["target_area"] = next(iter(rooms))
+        return resolved
+    implicit = False
+    if not marker and (voice_request or voice_area is not None):
+        first = normalize(next(_parts(prompt, catalog))) if _SEPARATOR.search(prompt) else normalized
+        implicit = bool(_GENERIC_LIGHT_SWITCH.fullmatch(first) and not _EXPLICIT_ALL.search(first))
+        if implicit and (EXPLICIT_LOCATION.search(normalized) or _GLOBAL.search(normalized)):
+            return Resolution("clarify", [], trace={"reason": "conflicting_room_scope"})
+    if not marker and not implicit:
+        if _LOCAL_OFF.fullmatch(normalized):
+            return Resolution("clarify", [], trace={"reason": "unspecified_area_for_everything"})
+        resolved = _resolve(prompt, catalog, language, reference, **options)
+        clauses = resolved.trace.get("clauses", [resolved.trace])
+        rooms = {room["id"] for clause in clauses for room in clause.get("rooms", [])}
+        if len(rooms) == 1 and (area := next(iter(rooms))) in {entity.get("area_id") for entity in catalog}:
+            area_ids = {entity["id"] for entity in catalog if entity.get("area_id") == area}
+            if not _room_bound(resolved, area_ids):
+                return Resolution("clarify", [], trace=resolved.trace | {"reason": "unverified_room_targets"})
+            resolved.trace["target_area"] = area
+        return resolved
+    if not voice_area:
+        return Resolution("clarify", [], trace={"reason": "unknown_voice_area"})
+    if marker and _LOCAL_OFF.fullmatch(normalized):
+        return _room_everything(catalog, voice_area, from_microphone=True)
+    area_catalog = [entity for entity in catalog if entity.get("area_id") == voice_area]
+    resolved = _resolve(stripped.strip(), area_catalog, language, reference, local_scope=True, **options)
+    ids = {entity["id"] for entity in area_catalog}
+    clauses = resolved.trace.get("clauses", [resolved.trace])
+    if not _room_bound(resolved, ids) or any(
+        evidence["method"] not in {"exact", "word_join"} for clause in clauses for evidence in clause.get("names", [])
+    ):
+        return Resolution("clarify", [], trace=resolved.trace | {"reason": "unverified_room_targets", "voice_area": voice_area, "target_area": voice_area})
+    resolved.trace.update(voice_area=voice_area, target_area=voice_area)
+    return resolved
+
+
+def _room_bound(resolved, area_ids):
+    return all(step.action != "activate" and target in area_ids and set(leaves) <= area_ids
+               for step in [*resolved.steps, *(choice.action for choice in resolved.choices)]
+               for target, leaves in step.members.items())
+
+
+def _room_everything(catalog, area, *, from_microphone=False):
+    scope, targets, rows = [], {}, []
+    for entity in catalog:
+        target = entity["id"]
+        if entity.get("area_id") != area or entity.get("group") or target.partition(".")[0] not in _LOCAL_POWER_DOMAINS:
+            continue
+        action = next((item for item in entity["actions"] if item["id"] == "turn_off" and not item.get("sensitive")), None)
+        if action is None:
+            continue
+        status = "not_allowed" if not action["enabled"] else "already_set" if entity["state"] == "off" else "target"
+        rows.append(dict(id=target, name=entity["name"], area=entity["area"], state=entity["state"], status=status))
+        if action["enabled"]:
+            scope.append(target)
+            if status == "target":
+                targets[target] = (target,)
+    trace = {"scope": rows, "room_everything": True, "target_area": area}
+    if from_microphone:
+        trace["voice_area"] = area
+    if not scope:
+        return Resolution("no_action", [], trace=trace)
+    summary = {"id": BULK_TARGET, "name": "Freigegebene Geräte im Raum", "area": rows[0]["area"], "count": len(targets or scope), "state": "off"}
+    if not targets:
+        return Resolution("already_set", [summary], trace=trace)
+    return Resolution("matched", [summary], {"turn_off": {}}, list(targets), [ActionCandidate("turn_off", targets, {}, {}, scope)], trace, True)
+
+
+def _resolve(prompt, catalog, language, reference, *, comfort, timings, previous_action, local_scope=False):
     normalized = normalize(prompt)
-    if local := _HERE_LIGHT.fullmatch(normalized):
-        if not voice_area:
-            return Resolution("clarify", [], trace={"reason": "unknown_voice_area"})
-        area_catalog = [entity for entity in catalog if entity.get("area_id") == voice_area]
-        power = "aus" if (local[1] or local[2]) in {"off", "aus"} else "an"
-        scoped = _part(f"schalte alle lichter {power}", area_catalog, language, (), timings=timings)
-        scoped.trace["voice_area"] = voice_area
-        return scoped
     if repeat := _REPEAT_LIGHT.fullmatch(prompt.strip()):
         if len(reference) == 1 and previous_action in {"turn_on", "turn_off"}:
             power = "an" if previous_action == "turn_on" else "aus"
@@ -390,11 +485,11 @@ def resolve(prompt, catalog, language, reference=(), *, comfort=False, timings=N
     exclusion = _EXCLUSION.search(prompt) or _LEAVE.search(prompt)
     without_marker = normalize(prompt[:exclusion.start()] + " " + prompt[exclusion.end():]) if exclusion else normalized
     if _QUESTION.search(normalized) or _EXCEPTION.search(without_marker) or _DEFERRED.search(normalized):
-        return _part(prompt, catalog, language, reference, timings=timings)
+        return _part(prompt, catalog, language, reference, timings=timings, local_scope=local_scope)
     if not exclusion and (alternatives := _ALTERNATIVES.fullmatch(prompt.strip())):
         return _bounded(alternatives.groups(), catalog, language, timings=timings)
     if exclusion:
-        return _exclusion(prompt, catalog, language, reference, timings)
+        return _exclusion(prompt, catalog, language, reference, timings, local_scope)
     if re.search(r"^(?:(?:und|and|nein|no) )?(?:die andere|the other|die im|those in|auch|also)\b", normalized):
         return Resolution("clarify", [], trace={"reason": "ambiguous_reference"})
     parsing_started = perf_counter()
@@ -407,13 +502,13 @@ def resolve(prompt, catalog, language, reference=(), *, comfort=False, timings=N
             interpreted = _bounded((f"set {target} brightness to 30 percent", f"set {target} to 2700 kelvin"), catalog, language, reason="configured_light_comfort", timings=timings)
             if interpreted.choices and all(choice.action.action == "light_set" for choice in interpreted.choices):
                 return interpreted
-        return _part(prompt, catalog, language, reference, timings=timings)
+        return _part(prompt, catalog, language, reference, timings=timings, local_scope=local_scope)
     if len(parts) > MAX_STEPS or not all(parts):
         return Resolution("clarify", [], trace={"reason": "invalid_clause_count"})
     clauses, steps = [], []
     entities = {}
     for part in parts:
-        item = _part(part, catalog, language, reference, previous_clause=bool(clauses), keep_noops=True, timings=timings)
+        item = _part(part, catalog, language, reference, previous_clause=bool(clauses), keep_noops=True, timings=timings, local_scope=local_scope)
         clauses.append(item.trace | {"status": item.status, "text": part[:512]})
         entities.update((entity["id"], entity) for entity in item.entities if entity["id"] != BULK_TARGET)
         if item.status not in {"matched", "already_set"} or any(target["status"] == "not_allowed" for target in item.trace.get("scope", [])):

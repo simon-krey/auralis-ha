@@ -5,3 +5,4 @@ PLAN_APPROVAL = {"multi", "single"}
 DEFAULTS = {"stt_url": "", "stt_model": "whisper-1", "stt_token": "", "llm_url": "", "llm_model": "", "llm_token": "", "llm_reasoning": "default", "llm_plan_approval": "multi", "llm_light_comfort": False, "system_prompt": DEFAULT_PROMPT, "history_enabled": True, "llm_full_context": False, "llm_context_budget": 8000}
 MAX_AUDIO = 10 * 1024 * 1024
 MAX_TEXT = 16000
+DEFAULTS.update(voice_room_overrides={}, local_fast_path=False, llm_timeout=60)

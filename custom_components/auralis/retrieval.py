@@ -179,7 +179,7 @@ def _normalized_alias(value, german):
     return number_words(normalized) if german else normalized
 
 
-def select_context(prompt, catalog, *, trace=None, language="de", strict=False, keep_noops=False, timings=None):
+def select_context(prompt, catalog, *, trace=None, language="de", strict=False, keep_noops=False, timings=None, local_scope=False):
     german = (language or "de").lower().split("-")[0].split("_")[0] == "de"
     def normalize_name(value):
         if len(value) <= 256:
@@ -252,7 +252,9 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     room_command = " ".join(word for word in room_command.split() if word not in {"bitte", "please", "mal", "kurz", "mir"})
     room_command = re.sub(r"^((?:schalte?|mache?) )ma ", r"\1", room_command)
     collective_switch = _COLLECTIVE_LIGHT_SWITCH.search(room_command) and _GENERIC_LIGHT_SWITCH.fullmatch(room_command)
-    room_lights = len(areas) == 1 and not named and (words & _PLURAL_LIGHTS or collective_switch or _ENGLISH_LIGHT_SWITCH.fullmatch(room_command))
+    room_lights = (local_scope or len(areas) == 1) and not named and (words & _PLURAL_LIGHTS or collective_switch or _ENGLISH_LIGHT_SWITCH.fullmatch(room_command))
+    if local_scope and not named and domains == {"switch"} and words & {"steckdosen", "schalter", "plugs", "switches"}:
+        explicit_all = True
     bulk = (len(domains) == 1 and domains <= {"light", "switch", "fan", "humidifier"} and explicit_all) or (domains == {"light"} and room_lights)
     candidates = []
     if named or areas or domains:
@@ -366,7 +368,7 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     actions = {entity["id"]: {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and item["id"] in hints and not (approximate and item.get("sensitive"))} for entity in candidates}
     measured("capability_policy_filter_ms", filtering_started)
     if trace is not None and strict:
-        trace["rejected_actions"] = [{"id": entity["id"], "action": item["id"], "reason": "unsupported" if item.get("supported") is False else "policy" if not item.get("enabled") else "approximate_sensitive"} for entity in candidates for item in entity["actions"] if item["id"] in hints and item["id"] not in actions[entity["id"]]][:50]
+        trace["rejected_actions"] = [{"id": entity["id"], "action": item["id"], "reason": item.get("disabled_reason") or ("unsupported" if item.get("supported") is False else "policy" if not item.get("enabled") else "approximate_sensitive")} for entity in candidates for item in entity["actions"] if item["id"] in hints and item["id"] not in actions[entity["id"]]][:50]
     if not bulk and not (coordinated and len(candidates) > 1):
         candidate = candidates[0]
         selected = actions[candidate["id"]]
@@ -391,7 +393,7 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     if trace is not None:
         trace["scope"] = [{"id": entity["id"], "name": entity["name"], "area": entity["area"], "state": entity["state"], "status": ("not_allowed" if action not in actions[entity["id"]] else "already_set" if (action, entity["state"]) in {("turn_off", "off"), ("turn_on", "on")} else "target")} for entity in candidates]
     targets = [entity["id"] for entity in eligible if keep_noops or (action, entity["state"]) not in {("turn_off", "off"), ("turn_on", "on")}]
-    target_area = candidates[0]["area"] if areas and next(iter(areas))[0] == "area" else candidates[0].get("floor") if areas else None
+    target_area = candidates[0]["area"] if local_scope or areas and next(iter(areas))[0] == "area" else candidates[0].get("floor") if areas else None
     selection = {"id": BULK_TARGET, "name": "Alle passenden Geräte" if domains != {"light"} else "Alle passenden Lampen", "area": target_area, "count": len(targets)}
     if not targets:
         return [selection | {"state": eligible[0]["state"], "count": len(eligible)}], {}, [], "already_set"

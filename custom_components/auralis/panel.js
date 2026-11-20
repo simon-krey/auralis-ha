@@ -49,6 +49,8 @@ class AuralisPanel extends HTMLElement {
       if (!this._alive) return;
       this._settings = data.settings || {};
       this._entities = Array.isArray(data.entities) ? data.entities : [];
+      this._voiceAreas = data.voice_areas || [];
+      this._voiceSatellites = data.voice_satellites || [];
       this.fillSettings();
       this.renderActions();
       this.status('Einstellungen geladen.');
@@ -64,6 +66,16 @@ class AuralisPanel extends HTMLElement {
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) this.$(`#${key}`).value = s[key] || '';
     this.$('#llm_reasoning').value = s.llm_reasoning || 'default';
     this.$('#llm_plan_approval').value = s.llm_plan_approval || 'multi';
+    this.$('#local_fast_path').checked = s.local_fast_path === true;
+    this.$('#llm_timeout').value = String(s.llm_timeout ?? 60);
+    this.$('#voice_room_overrides').value = Object.entries(s.voice_room_overrides || {}).map(([input, area]) => `${input} = ${area}`).join('\n');
+    this.$('#voice_room_choices').textContent = [
+      `Satelliten: ${this._voiceSatellites.join(', ') || 'keine'}`,
+      `Räume: ${this._voiceAreas.map(area => `${area.name} (${area.id})`).join(', ') || 'keine'}`,
+    ].join('\n');
+    this.$('#voice_inputs').replaceChildren(...this._voiceSatellites.map(input => {
+      const option = document.createElement('option'); option.value = input; return option;
+    }));
     this.$('#llm_light_comfort').checked = s.llm_light_comfort === true;
     this.$('#history_enabled').checked = !!s.history_enabled;
     this.$('#llm_full_context').checked = !!s.llm_full_context;
@@ -141,6 +153,14 @@ class AuralisPanel extends HTMLElement {
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) settings[key] = this.$(`#${key}`).value;
     settings.llm_reasoning = this.$('#llm_reasoning').value;
     settings.llm_plan_approval = this.$('#llm_plan_approval').value;
+    settings.local_fast_path = this.$('#local_fast_path').checked;
+    settings.llm_timeout = Number(this.$('#llm_timeout').value);
+    const mappings = this.$('#voice_room_overrides').value.split('\n').map(line => line.trim()).filter(Boolean).map(line => line.split('=').map(part => part.trim()));
+    if (mappings.some(parts => parts.length !== 2 || !parts[0] || !parts[1]) || new Set(mappings.map(parts => parts[0])).size !== mappings.length) {
+      this.status('Bitte je Zeile genau ein Assist-Gerät und eine Raum-ID angeben.', true);
+      return;
+    }
+    settings.voice_room_overrides = Object.fromEntries(mappings);
     settings.llm_light_comfort = this.$('#llm_light_comfort').checked;
     settings.history_enabled = this.$('#history_enabled').checked;
     settings.llm_full_context = this.$('#llm_full_context').checked;
@@ -153,10 +173,8 @@ class AuralisPanel extends HTMLElement {
     button.disabled = true;
     this.status('Einstellungen werden gespeichert …');
     try {
-      await this.call('save', { settings });
-      const data = await this.call('get');
+      const data = await this.call('save', { settings });
       this._settings = data.settings || {};
-      this._entities = Array.isArray(data.entities) ? data.entities : [];
       this.fillSettings();
       this.renderActions();
       this.status('Einstellungen gespeichert.');
@@ -177,14 +195,14 @@ class AuralisPanel extends HTMLElement {
       count++;
       const group = document.createElement('section'); group.className = 'entity';
       const title = document.createElement('h3'); title.textContent = entity.name || entity.id || 'Entität';
-      const meta = document.createElement('p'); meta.className = 'meta'; meta.textContent = [entity.id, entity.area, entity.state].filter(v => v != null && v !== '').join(' · ');
+      const meta = document.createElement('p'); meta.className = 'meta'; meta.textContent = [entity.id, entity.area, entity.state, entity.exposed === false ? 'Nicht für Assist freigegeben' : ''].filter(v => v != null && v !== '').join(' · ');
       group.append(title, meta);
       for (const action of filtered) {
         const label = document.createElement('label'); label.className = 'action';
         const text = document.createElement('span');
         const name = document.createElement('strong'); name.textContent = action.label || action.id || 'Aktion';
         text.append(name);
-        if (action.sensitive) { const warning = document.createElement('small'); warning.textContent = 'Sensibel · nach Freigabe ohne weitere Bestätigung ausführbar'; text.append(warning); }
+        if (action.sensitive) { const warning = document.createElement('small'); warning.textContent = 'Sensibel · nur mit Benutzer-ID und LLM-Freigabe'; text.append(warning); }
         const check = document.createElement('input'); check.type = 'checkbox'; check.checked = !!(action.configured ?? action.enabled);
         check.setAttribute('aria-label', `${action.label || action.id} für ${entity.name || entity.id} freigeben`);
         check.addEventListener('change', async () => {
@@ -220,7 +238,8 @@ class AuralisPanel extends HTMLElement {
     const button = this.$('#llm_test'); button.disabled = true;
     const result = this.$('#llm_result'); result.textContent = 'Test läuft …';
     try {
-      const data = await this.call('test_llm', { prompt: this.$('#test_prompt').value, language: this.$('#llm_language').value });
+      const voice_input = this.$('#test_voice_input').value.trim();
+      const data = await this.call('test_llm', { prompt: this.$('#test_prompt').value, language: this.$('#llm_language').value, ...(voice_input ? { voice_input } : {}) });
       result.textContent = data.error ? `Test fehlgeschlagen: ${data.error}` : `Antwort: ${data.answer || 'Keine Antwort'}\nWerkzeuge: ${this.format(data.tools)}`;
       result.textContent += this.testDiagnostics(data.diagnostics);
     } catch (error) { result.textContent = `Test fehlgeschlagen: ${this.error(error)}`; }
@@ -228,6 +247,16 @@ class AuralisPanel extends HTMLElement {
       button.disabled = false;
       if (this._alive && !this.$('#panel-history').hidden) void this.loadHistory();
     }
+  }
+  async warmModel() {
+    const button = this.$('#warm_model'); button.disabled = true;
+    this.status('Das gespeicherte Modell wird vorgewärmt …');
+    try {
+      const data = await this.call('warm_model');
+      if (data.error) this.status(data.error, true);
+      else this.status(`Modell erreichbar (${this.duration(data.duration_ms)}).`);
+    } catch (error) { this.status(`Vorwärmen fehlgeschlagen: ${this.error(error)}`, true); }
+    finally { button.disabled = false; }
   }
   format(value) {
     if (value == null || (Array.isArray(value) && !value.length)) return 'Keine';
@@ -257,6 +286,10 @@ class AuralisPanel extends HTMLElement {
       mixed_power_and_parameter_scope: 'Schalten und Einstellen bitte als getrennte Teilschritte angeben',
       power_action_disabled: 'Die zugehörige Ein- oder Ausschaltaktion ist nicht freigegeben',
       unknown_voice_area: 'Das Sprachgerät hat keinen bekannten Raum', unresolved_repeat_action: 'Vorherige Aktion oder neuer Raum nicht eindeutig',
+      conflicting_room_scope: 'Widersprüchliche Raumangaben', unverified_room_targets: 'Nicht alle Ziele liegen im bestätigten Raum',
+      unspecified_area_for_everything: 'Kein Raum für den Sammelbefehl angegeben',
+      assist_not_exposed: 'Nicht für Home Assistant Assist freigegeben', user_control_denied: 'Benutzer darf das Gerät nicht steuern',
+      anonymous_sensitive: 'Sensible Aktion ohne Benutzer-ID gesperrt',
       unsupported: 'Vom Gerät nicht unterstützt', policy: 'Aktion nicht freigegeben', approximate_sensitive: 'Unscharfer Treffer für eine sensible Aktion',
     };
     const describe = reason => Object.hasOwn(reasons, reason) ? reasons[reason] : reason;
@@ -287,21 +320,23 @@ class AuralisPanel extends HTMLElement {
   }
   confirmationText(confirmation) {
     if (!confirmation) return '';
+    if (confirmation.state === 'local_fast_path') return 'Lokal ausgeführt, ohne LLM-Bestätigung.';
     const state = ({ pending: 'keine Antwort erhalten', missing: 'keine Bestätigung erhalten', approved: 'bestätigt', rejected: 'abgelehnt', invalid: 'ungültige Bestätigung' })[confirmation.state];
     return state ? `Vorbereitete Aktion: ${confirmation.action} · ${state}` : '';
   }
   actionOutcomeText(outcome) {
     return ({
       no_executable_action: 'Keine ausführbare Aktion erkannt', already_set: 'Zustand bereits erreicht',
+      user_not_authorized: 'Benutzer nicht mehr berechtigt', unverified_voice_input: 'Assist-Eingabegerät nicht verifiziert',
       capability_or_policy_rejected: 'Aktion nicht unterstützt oder nicht freigegeben',
       tool_generation_failed: 'Werkzeuge konnten nicht erzeugt werden', required_tools_missing: 'Erforderliche Werkzeuge fehlen in der HTTP-Anfrage',
       context_budget_exceeded: 'Kontextbudget überschritten; Anfrage nicht gesendet',
-      provider_rejected: 'Anbieter hat die Anfrage abgelehnt', provider_failed: 'API-Anfrage fehlgeschlagen',
+      provider_rejected: 'Anbieter hat die Anfrage abgelehnt', provider_failed: 'API-Anfrage fehlgeschlagen', provider_timeout: 'LLM-Zeitlimit erreicht',
       model_invalid_response: 'Ungültige Anbieterantwort', model_no_tool_calls: 'Modellantwort ohne Werkzeugaufruf',
       model_invalid_tool_calls: 'Ungültige oder unvollständige Werkzeugaufrufe', model_output_truncated: 'Ausgabe am Modelllimit abgeschnitten',
       model_rejected_plan: 'Modell hat den Plan abgelehnt', preflight_rejected: 'Ausführungsprüfung fehlgeschlagen',
       dry_run_validated: 'Vollständiger Plan im Trockenlauf geprüft', dry_run_partial: 'Trockenlauf meldet übersprungene oder fehlgeschlagene Aktionen',
-      executed: 'Aktion ausgeführt', partial_failure: 'Teilweise ausgeführt', execution_failed: 'Keine Aktion ausgeführt',
+      executed: 'Aktion ausgeführt', partial_failure: 'Teilweise ausgeführt', execution_failed: 'Keine erfolgreiche Ausführung bestätigt',
     })[outcome] || outcome;
   }
   toolDeliveryText(delivery) {
@@ -313,6 +348,8 @@ class AuralisPanel extends HTMLElement {
     if (Number.isFinite(details.duration_ms)) lines.push(`Verarbeitungszeit: ${this.duration(details.duration_ms)}`);
     if (details.selection) lines.push(`Lokal vorbereitete Aktionen: ${this.offeredActions(details.selection)}`, this.selectionText(details.selection));
     if (details.action_outcome) lines.push(this.actionOutcomeText(details.action_outcome));
+    if (details.voice_origin) lines.push(`Assist: ${details.voice_origin.satellite_id || details.voice_origin.device_id || 'unbekannt'} · Raum: ${details.voice_origin.area || 'unbekannt'} (${details.voice_origin.source})`);
+    if (details.selection?.matches?.target_area) lines.push(`Zielbereich: ${details.selection.matches.target_area}`);
     const request = details.requests?.[0];
     if (request?.tool_delivery) lines.push(`${this.toolDeliveryText(request.tool_delivery)}${request.tool_names?.length ? `: ${request.tool_names.join(', ')}` : ''}`);
     if (details.context_budget?.fallback) lines.push('Vollkatalog zu groß: lokale Auswahl verwendet.');
@@ -341,6 +378,8 @@ class AuralisPanel extends HTMLElement {
     const disclosure = document.createElement('details');
     const title = document.createElement('summary'); title.textContent = 'Verarbeitungsdetails'; disclosure.append(title);
     const values = [];
+    if (details.voice_origin) values.push(['Assist-Eingabegerät & Raumzuordnung', details.voice_origin]);
+    if (selection?.matches?.target_area) values.push(['Tatsächlicher Zielbereich', selection.matches.target_area]);
     if (details.context_budget) {
       const budget = details.context_budget;
       const tokens = value => Number.isFinite(value) ? value.toLocaleString('de-DE') : '–';
@@ -553,11 +592,16 @@ class AuralisPanel extends HTMLElement {
       <section class="card"><div class="card-head"><p class="eyebrow">01 / Verbindung</p><h2>Dienste & Einstellungen</h2><p class="muted">Änderungen gelten nach dem Speichern.</p></div><p id="destinations" class="notice"></p><form id="settings"><h3 class="subheading">Spracheingabe · STT</h3><div class="fields"><label class="field">STT-URL<input id="stt_url" type="url" autocomplete="off"></label><label class="field">Modell<input id="stt_model" autocomplete="off"></label><label class="field">Token <span id="stt_token_state" class="meta"></span><select id="stt_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues STT-Token<input id="stt_token" type="password" autocomplete="new-password" disabled></label></div><h3 class="subheading">Verarbeitung · LLM</h3><div class="fields"><label class="field">LLM-Basis-URL<input id="llm_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label><label class="field">Modell<input id="llm_model" list="llm_models" aria-describedby="model_status" autocomplete="off"><datalist id="llm_models"></datalist></label><label class="field">Token <span id="llm_token_state" class="meta"></span><select id="llm_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues LLM-Token<input id="llm_token" type="password" autocomplete="new-password" disabled></label><div class="wide model-controls"><button id="load_models" type="button">Modelle laden</button><p id="model_status" class="meta" role="status"></p></div>
       <label class="field wide">Reasoning (Thinking)<select id="llm_reasoning" aria-describedby="llm_reasoning_help"><option value="default">Anbieterstandard</option><option value="on">An</option><option value="off">Aus</option></select><small id="llm_reasoning_help">An und Aus setzen Unterstützung für reasoning_effort voraus. Bei Fehlern Anbieterstandard wählen.</small></label>
       <label class="field wide">Aktionsplan bestätigen<select id="llm_plan_approval"><option value="multi">Bisherige Werkzeuge</option><option value="single">Gesamten Plan einmal bestätigen</option></select></label>
+      <label class="field">LLM-Zeitlimit (Sekunden)<input id="llm_timeout" type="number" min="5" max="120" required></label>
+      <div class="model-controls"><button id="warm_model" type="button">Gespeichertes Modell vorwärmen</button><small>Sendet eine minimale Anfrage ohne Geräte oder Werkzeuge.</small></div>
+      <label class="checkrow wide"><input id="local_fast_path" type="checkbox"> Eindeutige, risikoarme Lichtbefehle ohne LLM ausführen</label>
+      <label class="field wide">Manuelle Assist-Raumzuordnung<textarea id="voice_room_overrides" placeholder="assist_satellite.beispiel = wohnzimmer"></textarea><small>Nur wenn Home Assistant keinen Raum liefert. Pro Zeile: Satelliten-Entitäts-ID oder Geräte-ID = Raum-ID.</small></label>
+      <details class="wide"><summary>Verfügbare Satelliten und Raum-IDs</summary><p id="voice_room_choices" class="meta"></p></details>
       <label class="field wide"><span><input id="llm_light_comfort" type="checkbox"> „Gemütlicher“ bei Licht als begrenzte Auswahl zulassen</span><small>Das Modell darf 30 % oder Warmweiß (2700 K) wählen, wenn beide Optionen unterstützt und erlaubt sind.</small></label>
       <label class="checkrow wide"><input id="llm_full_context" type="checkbox" aria-describedby="llm_full_context_help"> Alle Geräte an das LLM senden</label><p id="llm_full_context_help" class="meta wide">Sendet freigegebene Geräte und Aktionen an den eingestellten LLM-Endpunkt.</p>
       <label class="field wide">LLM-Kontextbudget<select id="llm_context_budget" aria-describedby="llm_context_budget_help"><option value="8000">8.000 Tokens (empfohlen)</option><option value="16000">16.000 Tokens</option></select><small id="llm_context_budget_help">Schätzwert inklusive Antwort. Passt der Vollkatalog nicht hinein, greift die lokale Auswahl.</small></label>
       <label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>
-      <section class="card"><div class="card-head"><p class="eyebrow">03 / Test</p><h2>Sprachtest</h2><p class="muted">Eine Aufnahme an das gespeicherte STT-Ziel senden. Maximal 30 Sekunden.</p></div><label class="field">Sprache<input id="stt_language" value="de" autocomplete="off"></label><p class="meta">Mikrofonzugriff benötigt HTTPS oder localhost und deine Erlaubnis.</p><button id="record" type="button">Aufnahme starten</button><p id="stt_result" class="result" role="status" aria-live="polite"></p><hr class="divider"><h3>LLM-Probelauf</h3><p class="meta">Testet die Verarbeitung mit den gespeicherten Einstellungen.</p><form id="llm_form"><label class="field">Sprache<input id="llm_language" value="de" autocomplete="off"></label><label class="field">Testnachricht<textarea id="test_prompt" required></textarea></label><p><button id="llm_test" type="submit">LLM testen</button></p></form><p id="llm_result" class="result" role="status" aria-live="polite"></p></section>
+      <section class="card"><div class="card-head"><p class="eyebrow">03 / Test</p><h2>Sprachtest</h2><p class="muted">Eine Aufnahme an das gespeicherte STT-Ziel senden. Maximal 30 Sekunden.</p></div><label class="field">Sprache<input id="stt_language" value="de" autocomplete="off"></label><p class="meta">Mikrofonzugriff benötigt HTTPS oder localhost und deine Erlaubnis.</p><button id="record" type="button">Aufnahme starten</button><p id="stt_result" class="result" role="status" aria-live="polite"></p><hr class="divider"><h3>LLM-Probelauf</h3><p class="meta">Testet die Verarbeitung mit den gespeicherten Einstellungen.</p><form id="llm_form"><label class="field">Sprache<input id="llm_language" value="de" autocomplete="off"></label><label class="field">Assist-Eingabegerät (optional)<input id="test_voice_input" list="voice_inputs" placeholder="Satelliten-Entitäts-ID oder Geräte-ID"><datalist id="voice_inputs"></datalist></label><label class="field">Testnachricht<textarea id="test_prompt" required></textarea></label><p><button id="llm_test" type="submit">LLM testen</button></p></form><p id="llm_result" class="result" role="status" aria-live="polite"></p></section>
         </div>
       </div>
       <div id="panel-history" role="tabpanel" aria-labelledby="tab-history" tabindex="0" hidden>
@@ -588,6 +632,7 @@ class AuralisPanel extends HTMLElement {
     this.$('#reset_actions').addEventListener('click', () => this.resetActions());
     this.$('#search').addEventListener('input', () => this.renderActions());
     this.$('#llm_form').addEventListener('submit', e => this.testLLM(e));
+    this.$('#warm_model').addEventListener('click', () => this.warmModel());
     this.$('#record').addEventListener('click', () => this.record());
     this.$('#prev').addEventListener('click', () => { this._offset = Math.max(0, this._offset - 20); this.loadHistory(); });
     this.$('#next').addEventListener('click', () => { this._offset += 20; this.loadHistory(); });

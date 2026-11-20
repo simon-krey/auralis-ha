@@ -29,6 +29,9 @@ for domain, (name, values) in _FEATURE_STUBS.items():
     setattr(module, name, IntFlag(name, values))
     stubs[module_name] = module
 sys.modules.update(stubs)
+exposure = types.ModuleType("homeassistant.components.homeassistant.exposed_entities")
+exposure.async_should_expose = lambda hass, assistant, entity_id: entity_id not in getattr(hass, "hidden", ())
+sys.modules[exposure.__name__] = exposure
 spec.loader.exec_module(actions)
 ActionPolicy = actions.ActionPolicy
 
@@ -144,7 +147,11 @@ class PolicyTests(unittest.TestCase):
     def test_sensitive_and_live_override(self):
         self.assertEqual(self.run_action("unlock", ["lock.front"])["executed"], [])
         self.overrides["lock.front:unlock"] = True
-        self.assertEqual(self.run_action("unlock", ["lock.front"])["executed"], ["lock.front"])
+        self.assertFalse(self.run_action("unlock", ["lock.front"])["executed"])
+        admin = SimpleNamespace(id="admin", is_active=True, is_admin=True, permissions=SimpleNamespace(check_entity=lambda *_: True))
+        self.ctx.user_id = admin.id
+        self.assertEqual(self.run_action("unlock", ["lock.front"], user=admin)["executed"], ["lock.front"])
+        self.ctx.user_id = None
         self.assertEqual(self.run_action("open", ["cover.door"])["executed"], [])
         self.assertEqual(self.run_action("open", ["cover.shade"])["executed"], ["cover.shade"])
 
@@ -152,10 +159,13 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(self.run_action("activate", ["scene.opaque", "script.test"])["executed"])
         self.overrides.update({"scene.opaque:activate": True, "scene.native:activate": True,
                                "script.test:activate": True})
-        self.assertEqual(self.run_action("activate", ["scene.native"])["executed"], [])
-        self.assertEqual(self.run_action("activate", ["scene.opaque", "script.test"])["executed"], ["scene.opaque", "script.test"])
+        self.assertFalse(self.run_action("activate", ["scene.opaque", "script.test"])["executed"])
+        admin = SimpleNamespace(id="admin", is_active=True, is_admin=True, permissions=SimpleNamespace(check_entity=lambda *_: True))
+        self.ctx.user_id = admin.id
+        self.assertEqual(self.run_action("activate", ["scene.native"], user=admin)["executed"], [])
+        self.assertEqual(self.run_action("activate", ["scene.opaque", "script.test"], user=admin)["executed"], ["scene.opaque", "script.test"])
         self.overrides.update({"lock.front:lock": True, "lock.front:unlock": True})
-        self.assertEqual(self.run_action("activate", ["scene.native"])["executed"], ["scene.native"])
+        self.assertEqual(self.run_action("activate", ["scene.native"], user=admin)["executed"], ["scene.native"])
 
     def test_injection_and_context(self):
         self.assertTrue(self.run_action("light_set", ["light.one"], {"entity_id": "lock.front"})["errors"])

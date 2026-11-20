@@ -194,11 +194,20 @@ def power_permission(action, parameters):
     return None
 
 
+def _service(action, entity_id):
+    domain = entity_id.partition(".")[0]
+    if action in {"open", "close", "stop"}:
+        return domain, f"{action}_{domain}"
+    if action == "set_position":
+        return domain, f"set_{domain}_position"
+    return domain, _ACTIONS[action][2]
+
+
 def _permission(user, entity_id, permission):
     if user is None:
         return True
     try:
-        return bool(user.is_active and (user.is_admin or user.permissions.check_entity(entity_id, permission)))
+        return bool(user.is_active and user.permissions.check_entity(entity_id, permission))
     except (AttributeError, TypeError):
         return False
 
@@ -207,6 +216,15 @@ class ActionPolicy:
     def __init__(self, hass, overrides):
         self.hass = hass
         self.overrides = overrides
+
+    def _exposed(self, entity_id):
+        from homeassistant.components.homeassistant.exposed_entities import async_should_expose
+
+        return not getattr(self._registry_entry(entity_id), "disabled_by", None) and async_should_expose(self.hass, "conversation", entity_id) is True
+
+    def _can_control(self, state, user):
+        return (self._exposed(state.entity_id) and _permission(user, state.entity_id, "control")
+                and (user is not None or not self._sensitive(state) and not state.entity_id.startswith("scene.")))
 
     def _registry_entry(self, entity_id):
         try:
@@ -234,19 +252,53 @@ class ActionPolicy:
         entry = self._registry_entry(state.entity_id)
         return state.entity_id.startswith("group.") or bool(entry and entry.platform == "group")
 
-    def voice_area_id(self, device_id, satellite_id):
-        if satellite_id and satellite_id.startswith("assist_satellite.") and (area := self._area(satellite_id)):
-            return area.id
-        if not device_id:
-            return None
+    def voice_location(self, device_id, satellite_id, fallback):
+        result = {"device_id": device_id, "satellite_id": satellite_id, "area_id": None, "source": "unknown", "verified": False}
         try:
-            from homeassistant.helpers import device_registry
-            device = device_registry.async_get(self.hass).async_get(device_id)
-            return device_registry.async_get_effective_area_id(self.hass, device) if device else None
+            from homeassistant.helpers import area_registry, device_registry
+            devices = device_registry.async_get(self.hass)
+            areas = area_registry.async_get(self.hass)
         except (ImportError, AttributeError, KeyError):
-            return None
+            return result
+        satellite = self._registry_entry(satellite_id) if satellite_id and satellite_id.startswith("assist_satellite.") else None
+        if satellite_id and (satellite is None or getattr(satellite, "disabled_by", None)):
+            return result
+        satellite_device = satellite.device_id if satellite else None
+        if device_id and satellite_device and device_id != satellite_device:
+            return result | {"source": "conflict"}
+        effective_device = satellite_device or device_id
+        device = devices.async_get(effective_device) if effective_device else None
+        if (effective_device and device is None) or not (satellite or device):
+            return result
+        result.update(device_id=effective_device, verified=True)
+        device_area = device_registry.async_get_effective_area_id(self.hass, device) if device else None
+        satellite_area = satellite.area_id if satellite else None
+        if satellite_area and device_area and satellite_area != device_area:
+            return result | {"source": "conflict"}
+        area_id = satellite_area or device_area
+        source = "satellite_entity" if satellite_area else ("device" if device and device.area_id else "parent_device")
+        if area_id is None:
+            manual = {fallback[key] for key in (satellite_id, effective_device) if key in fallback}
+            if len(manual) > 1:
+                return result | {"source": "conflict"}
+            area_id, source = next(iter(manual), None), "manual"
+        if area_id and (area := areas.async_get_area(area_id)):
+            result.update(area_id=area.id, area=area.name, source=source)
+        return result
 
-    def _leaves(self, entity_id, *, user=None, action=None):
+    def in_area(self, entity_id, area_id):
+        return getattr(self._area(entity_id), "id", None) == area_id
+
+    def identity(self, entity_id):
+        return getattr(self._registry_entry(entity_id), "id", None)
+
+    def room_group_ok(self, entity_id, area_id):
+        try:
+            return all(self.in_area(leaf, area_id) for leaf in self._leaves(entity_id, enforce_exposure=False))
+        except ValueError:
+            return False
+
+    def _leaves(self, entity_id, *, user=None, action=None, enforce_exposure=True):
         visited, expanding, leaves = set(), set(), []
 
         def walk(target):
@@ -263,7 +315,8 @@ class ActionPolicy:
             if not self._group(state):
                 leaves.append(target)
                 return
-            if state.state in {"unavailable", "unknown"} or not _permission(user, target, "read") or not _permission(user, target, "control") or (action and not self._enabled(state, action)[0]):
+            if (state.state in {"unavailable", "unknown"} or not _permission(user, target, "read") or not _permission(user, target, "control")
+                    or enforce_exposure and not self._can_control(state, user) or action and not self._enabled(state, action)[0]):
                 raise ValueError("group unavailable or permission denied")
             members = state.attributes.get("entity_id")
             if not isinstance(members, (list, tuple)) or not members or len(members) > MAX_GROUP_NODES or any(not isinstance(member, str) or not _ENTITY.fullmatch(member) for member in members):
@@ -320,18 +373,30 @@ class ActionPolicy:
         if (require_native and (not entry or entry.platform != "homeassistant")) or not isinstance(members, (list, tuple)) or not members or len(members) > MAX_GROUP_NODES:
             return False
         try:
-            leaves = [leaf for member in members for leaf in self._leaves(member, user=user)]
+            leaves = [leaf for member in members for leaf in self._leaves(member, user=user, enforce_exposure=not defaults_only)]
             for leaf in leaves:
                 target = self.hass.states.get(leaf)
                 domain = leaf.split(".", 1)[0]
                 actions = [name for name, spec in _ACTIONS.items() if domain in spec[1]]
                 if target.state in {"unavailable", "unknown"} or domain in {"scene", "script"} or not actions or not _permission(user, leaf, "read") or not _permission(user, leaf, "control"):
                     return False
+                if not defaults_only and not self._can_control(target, user):
+                    return False
                 if any(not self._enabled(target, name)[1 if defaults_only else 0] for name in actions):
                     return False
             return True
         except (ValueError, TypeError, AttributeError, RecursionError):
             return False
+
+    def scene_scope(self, entity_id):
+        state = self.hass.states.get(entity_id)
+        members = state.attributes.get("entity_id") if state else None
+        if not isinstance(members, (list, tuple)) or not members or len(members) > MAX_GROUP_NODES:
+            return None
+        try:
+            return tuple(sorted({leaf for member in members for leaf in self._leaves(member, enforce_exposure=False)}))
+        except (ValueError, TypeError, RecursionError):
+            return None
 
     def _scope_ok(self, state, user):
         domain = state.entity_id.split(".", 1)[0]
@@ -342,9 +407,9 @@ class ActionPolicy:
         # Exposed members remain binding even when the scene may have more.
         if domain == "scene" and "entity_id" in state.attributes and not self._scene_safe(state, user, require_native=False):
             return False
-        return self.overrides.get(f"{state.entity_id}:activate") is True and (user is None or bool(getattr(user, "is_admin", False)))
+        return self.overrides.get(f"{state.entity_id}:activate") is True and bool(getattr(user, "is_admin", False))
 
-    def catalog(self, user=None, *, for_retrieval=False, trace=None):
+    def catalog(self, user=None, *, for_retrieval=False, trace=None, area_id=None):
         def timed(stage, function, *args, **kwargs):
             if trace is None:
                 return function(*args, **kwargs)
@@ -358,9 +423,16 @@ class ActionPolicy:
         result = []
         for state in timed("state", self.hass.states.async_all):
             entity_id = state.entity_id
+            area = timed("registry", self._area, entity_id) if area_id else None
+            if area_id and getattr(area, "id", None) != area_id:
+                continue
             if not _permission(user, entity_id, "read"):
                 continue
+            exposed = timed("registry", self._exposed, entity_id)
             domain = entity_id.split(".", 1)[0]
+            can_control = _permission(user, entity_id, "control")
+            sensitive = self._sensitive(state)
+            anonymous_sensitive = user is None and (sensitive or domain == "scene")
             actions = []
             group = timed("group", self._group, state)
             domain_actions = _ACTIONS.items() if group else _DOMAIN_ACTIONS.get(domain, ())
@@ -370,7 +442,7 @@ class ActionPolicy:
                     if not group:
                         continue
                     try:
-                        if not any(x.split(".", 1)[0] in domains for x in timed("group", self._leaves, entity_id, user=user)):
+                        if not any(x.split(".", 1)[0] in domains for x in timed("group", self._leaves, entity_id, user=user, enforce_exposure=for_retrieval)):
                             continue
                     except ValueError:
                         continue
@@ -380,30 +452,38 @@ class ActionPolicy:
                 supported = timed("capability", _capability, state, action)
                 if group:
                     try:
-                        members = sorted(set(timed("group", self._leaves, entity_id, user=user, action=action)))
+                        members = sorted(set(timed("group", self._leaves, entity_id, user=user, action=action, enforce_exposure=for_retrieval)))
                         targets = [self.hass.states.get(member) for member in members]
                         capabilities = [timed("capability", _capability, target, action) for target in targets]
                         supported = shared_parameters(capabilities) if all(cap is not None for cap in capabilities) else None
                         if params and not supported:
                             supported = None
-                        authorized = [_permission(user, target.entity_id, "read") and _permission(user, target.entity_id, "control") and self._enabled(target, action)[0] and self._scope_ok(target, user) and capability is not None for target, capability in zip(targets, capabilities)]
+                        authorized = [_permission(user, target.entity_id, "read") and (self._can_control(target, user) if for_retrieval else _permission(user, target.entity_id, "control")) and self._enabled(target, action)[0] and self._scope_ok(target, user) and capability is not None for target, capability in zip(targets, capabilities)]
                         enabled = enabled and (all(authorized) if for_retrieval else any(authorized))
                     except ValueError:
                         enabled = False
-                enabled = enabled and (supported is not None or group and not for_retrieval) and _permission(user, entity_id, "control") and self._scope_ok(state, user)
+                enabled = enabled and (supported is not None or group and not for_retrieval) and can_control and self._scope_ok(state, user)
+                if for_retrieval and (not exposed or anonymous_sensitive):
+                    enabled = False
                 schema = supported if supported is not None else {}
-                item = {"id": action, "label": label, "enabled": enabled, "supported": supported is not None, "configured": configured, "default_enabled": default, "sensitive": self._sensitive(state) or (domain == "scene" and not default), "parameters": {"type": "object", "properties": schema, "required": list(schema) if action != "light_set" else [], "additionalProperties": False}}
+                item = {"id": action, "label": label, "enabled": enabled, "supported": supported is not None, "configured": configured, "default_enabled": default, "sensitive": sensitive or (domain == "scene" and not default), "parameters": {"type": "object", "properties": schema, "required": list(schema) if action != "light_set" else [], "additionalProperties": False}}
+                if for_retrieval and not enabled:
+                    item["disabled_reason"] = ("assist_not_exposed" if not exposed else "user_control_denied" if not can_control
+                                               else "anonymous_sensitive" if anonymous_sensitive else "unsupported" if supported is None else "policy")
                 if for_retrieval and enabled and members:
                     item["members"] = members
                     item["sensitive"] |= any(self._sensitive(target) for target in targets)
                 actions.append(item)
             if actions or domain in {"binary_sensor", "sensor"}:
-                area = timed("registry", self._area, entity_id)
-                entity = {"id": entity_id, "name": str(state.attributes.get("friendly_name", entity_id)), "area": area.name if area else None, "state": str(state.state), "actions": actions}
+                if area is None:
+                    area = timed("registry", self._area, entity_id)
+                entity = {"id": entity_id, "name": str(state.attributes.get("friendly_name", entity_id)), "area": area.name if area else None, "state": str(state.state), "actions": actions, "exposed": exposed}
                 if for_retrieval:
                     entry = timed("registry", self._registry_entry, entity_id)
                     device_name, floor = timed("registry", self._location_metadata, area, entry)
                     entity.update(aliases=[alias for alias in getattr(entry, "aliases", ()) if isinstance(alias, str)], area_aliases=getattr(area, "aliases", ()), area_id=area.id if area else None, registry_id=getattr(entry, "id", None), group=group, device_class=state.attributes.get("device_class"))
+                    if domain == "scene" and any(item["enabled"] for item in actions):
+                        entity["scene_scope"] = self.scene_scope(entity_id)
                     live_values = {key: state.attributes[key] for key in ("brightness", "volume_level", "temperature", "percentage_step") if key in state.attributes}
                     if live_values:
                         entity["live_values"] = live_values
@@ -425,7 +505,7 @@ class ActionPolicy:
         target = self.hass.states.get(entity_id)
         if target is None:
             return "errors", "unknown entity"
-        if not _permission(user, entity_id, "read") or not _permission(user, entity_id, "control"):
+        if not _permission(user, entity_id, "read") or not self._can_control(target, user):
             return "skipped", "permission denied"
         capability = _capability(target, action)
         if capability is None or self._group(target):
@@ -437,6 +517,8 @@ class ActionPolicy:
         if power := power_permission(action, parameters):
             if not self._enabled(target, power)[0]:
                 return "skipped", "power action disabled"
+        if (has_service := getattr(self.hass.services, "has_service", None)) and not has_service(*_service(action, entity_id)):
+            return "errors", "service not registered"
         return None
 
     def preflight(self, action, entity_ids, parameters, context, *, user=None, expected_leaves=None):
@@ -466,7 +548,7 @@ class ActionPolicy:
             if state is None:
                 error(entity_id, "unknown entity")
                 continue
-            if not _permission(user, entity_id, "read") or not _permission(user, entity_id, "control"):
+            if not _permission(user, entity_id, "read") or not self._can_control(state, user):
                 result["skipped"].append({"entity_id": entity_id, "reason": "permission denied"})
                 continue
             if self._group(state) and not self._enabled(state, action)[0]:
@@ -491,7 +573,7 @@ class ActionPolicy:
             error(None, "target set changed or no longer authorized")
         return result
 
-    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None, expected_leaves=None):
+    async def run(self, action, entity_ids, parameters, context, *, dry_run=False, user=None, expected_leaves=None, guard=None):
         result = self.preflight(action, entity_ids, parameters, context, user=user, expected_leaves=expected_leaves)
         if expected_leaves is not None and (result["errors"] or result["skipped"]):
             result["planned"] = []
@@ -501,14 +583,24 @@ class ActionPolicy:
         targets, result["planned"] = result["planned"], []
         contains_groups = expected_leaves is not None and set(entity_ids) != set(expected_leaves)
         for index, leaf in enumerate(targets):
-            if contains_groups:
-                live = self.preflight(action, entity_ids, parameters, context, user=user, expected_leaves=expected_leaves)
-                if live["errors"] or live["skipped"]:
-                    result["errors"].extend(live["errors"])
-                    result["skipped"].extend(live["skipped"])
-                    result["skipped"].extend({"entity_id": target, "reason": "group changed or no longer authorized"} for target in targets[index:])
-                    break
-            failure = self._check_leaf(leaf, action, parameters, user)
+            try:
+                if guard:
+                    user, reason = await guard(leaf, entity_ids if contains_groups else ())
+                    if reason:
+                        result["skipped"].extend({"entity_id": target, "reason": reason} for target in targets[index:])
+                        break
+                if contains_groups:
+                    live = self.preflight(action, entity_ids, parameters, context, user=user, expected_leaves=expected_leaves)
+                    if live["errors"] or live["skipped"]:
+                        result["errors"].extend(live["errors"])
+                        result["skipped"].extend(live["skipped"])
+                        result["skipped"].extend({"entity_id": target, "reason": "group changed or no longer authorized"} for target in targets[index:])
+                        break
+                failure = self._check_leaf(leaf, action, parameters, user)
+            except Exception as error:
+                result["errors"].append({"entity_id": leaf, "reason": "live authorization could not be verified", "detail": type(error).__name__})
+                result["skipped"].extend({"entity_id": target, "reason": "earlier target could not be verified"} for target in targets[index + 1:])
+                break
             if failure:
                 category, reason = failure
                 result[category].append({"entity_id": leaf, "reason": reason})
@@ -516,8 +608,7 @@ class ActionPolicy:
                     result["skipped"].extend({"entity_id": target, "reason": "earlier target changed"} for target in targets[index + 1:])
                     break
                 continue
-            domain = leaf.partition(".")[0]
-            service = {"open": f"open_{domain}", "close": f"close_{domain}", "stop": f"stop_{domain}", "set_position": f"set_{domain}_position"}.get(action, _ACTIONS[action][2])
+            domain, service = _service(action, leaf)
             try:
                 await self.hass.services.async_call(domain, service, {"entity_id": leaf, **parameters}, blocking=True, context=context)
                 result["executed"].append(leaf)
