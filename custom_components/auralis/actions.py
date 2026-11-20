@@ -8,7 +8,10 @@ None is reserved for HA's userless contexts (for example voice satellites).
 
 from collections.abc import Mapping
 import math
+from functools import cache
 import re
+from time import perf_counter
+
 
 _ENTITY = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 _DEFAULT_DOMAINS = {"light", "switch", "climate", "fan", "humidifier", "cover", "group", "scene"}
@@ -67,17 +70,33 @@ _ACTIONS = {
     "set_value": ("Set value", {"number", "input_number"}, "set_value", {"value": _number(-1e9, 1e9)}),
 }
 
-_FEATURES = {
-    "fan": {"turn_on": 32, "turn_off": 16, "fan_set_percentage": 1, "fan_oscillate": 2},
-    "cover": {"open": 1, "close": 2, "set_position": 4, "stop": 8},
-    "valve": {"open": 1, "close": 2, "set_position": 4, "stop": 8},
-    "climate": {"climate_temperature": 1},
-    "media_player": {"media_play": 16384, "media_pause": 1, "media_stop": 4096,
-                     "media_next_track": 32, "media_previous_track": 16, "volume_set": 4},
-    "vacuum": {"vacuum_start": 8192, "vacuum_pause": 4, "vacuum_return_to_base": 16},
-    "alarm_control_panel": {"alarm_arm_home": 1, "alarm_arm_away": 2},
-    "siren": {"turn_on": 1, "turn_off": 2},
-}
+_DOMAIN_ACTIONS = {domain: tuple((action, spec) for action, spec in _ACTIONS.items() if domain in spec[1])
+                   for domain in {name for _, domains, _, _ in _ACTIONS.values() for name in domains}}
+
+
+@cache
+def _features():
+    from homeassistant.components.alarm_control_panel.const import AlarmControlPanelEntityFeature
+    from homeassistant.components.climate.const import ClimateEntityFeature
+    from homeassistant.components.cover.const import CoverEntityFeature
+    from homeassistant.components.fan.const import FanEntityFeature
+    from homeassistant.components.media_player.const import MediaPlayerEntityFeature
+    from homeassistant.components.siren.const import SirenEntityFeature
+    from homeassistant.components.valve.const import ValveEntityFeature
+    from homeassistant.components.vacuum.const import VacuumEntityFeature
+
+    return {
+        "fan": {"turn_on": FanEntityFeature.TURN_ON, "turn_off": FanEntityFeature.TURN_OFF, "fan_set_percentage": FanEntityFeature.SET_SPEED, "fan_oscillate": FanEntityFeature.OSCILLATE},
+        "cover": {"open": CoverEntityFeature.OPEN, "close": CoverEntityFeature.CLOSE, "set_position": CoverEntityFeature.SET_POSITION, "stop": CoverEntityFeature.STOP},
+        "valve": {"open": ValveEntityFeature.OPEN, "close": ValveEntityFeature.CLOSE, "set_position": ValveEntityFeature.SET_POSITION, "stop": ValveEntityFeature.STOP},
+        "climate": {"climate_temperature": ClimateEntityFeature.TARGET_TEMPERATURE},
+        "media_player": {"media_play": MediaPlayerEntityFeature.PLAY, "media_pause": MediaPlayerEntityFeature.PAUSE, "media_stop": MediaPlayerEntityFeature.STOP,
+                         "media_next_track": MediaPlayerEntityFeature.NEXT_TRACK, "media_previous_track": MediaPlayerEntityFeature.PREVIOUS_TRACK, "volume_set": MediaPlayerEntityFeature.VOLUME_SET},
+        "vacuum": {"vacuum_start": VacuumEntityFeature.START, "vacuum_pause": VacuumEntityFeature.PAUSE, "vacuum_return_to_base": VacuumEntityFeature.RETURN_HOME},
+        "alarm_control_panel": {"alarm_arm_home": AlarmControlPanelEntityFeature.ARM_HOME, "alarm_arm_away": AlarmControlPanelEntityFeature.ARM_AWAY},
+        "siren": {"turn_on": SirenEntityFeature.TURN_ON, "turn_off": SirenEntityFeature.TURN_OFF},
+    }
+
 _COLOR = {"hs", "xy", "rgb", "rgbw", "rgbww"}
 
 
@@ -101,7 +120,7 @@ def _capability(state, action):
     if domain not in domains or state.state in {"unavailable", "unknown"}:
         return None
     attrs = state.attributes
-    feature = _FEATURES.get(domain, {}).get(action)
+    feature = _features().get(domain, {}).get(action) if domain in {"fan", "cover", "valve", "climate", "media_player", "vacuum", "alarm_control_panel", "siren"} else None
     if feature and (not isinstance(attrs.get("supported_features"), int) or isinstance(attrs["supported_features"], bool) or not attrs["supported_features"] & feature):
         return None
     if action == "light_set":
@@ -167,6 +186,14 @@ def valid_parameters(action, parameters, schema):
     return bool(parameters) and len(parameters.keys() & {"brightness", "brightness_pct"}) <= 1 and len(parameters.keys() & {"rgb_color", "hs_color", "color_temp_kelvin"}) <= 1 and ("hs_color" not in parameters or parameters["hs_color"][1] <= 100)
 
 
+def power_permission(action, parameters):
+    if action == "light_set":
+        return "turn_off" if parameters.get("brightness_pct", parameters.get("brightness")) == 0 else "turn_on"
+    if action == "fan_set_percentage":
+        return "turn_off" if parameters["percentage"] == 0 else "turn_on"
+    return None
+
+
 def _permission(user, entity_id, permission):
     if user is None:
         return True
@@ -197,7 +224,7 @@ class ActionPolicy:
             area_id = entry.area_id
             if not area_id and entry.device_id:
                 device = device_registry.async_get(self.hass).async_get(entry.device_id)
-                area_id = device.area_id if device else None
+                area_id = device_registry.async_get_effective_area_id(self.hass, device) if device else None
             area = area_registry.async_get(self.hass).async_get_area(area_id) if area_id else None
             return area
         except (ImportError, AttributeError, KeyError):
@@ -206,6 +233,18 @@ class ActionPolicy:
     def _group(self, state):
         entry = self._registry_entry(state.entity_id)
         return state.entity_id.startswith("group.") or bool(entry and entry.platform == "group")
+
+    def voice_area_id(self, device_id, satellite_id):
+        if satellite_id and satellite_id.startswith("assist_satellite.") and (area := self._area(satellite_id)):
+            return area.id
+        if not device_id:
+            return None
+        try:
+            from homeassistant.helpers import device_registry
+            device = device_registry.async_get(self.hass).async_get(device_id)
+            return device_registry.async_get_effective_area_id(self.hass, device) if device else None
+        except (ImportError, AttributeError, KeyError):
+            return None
 
     def _leaves(self, entity_id, *, user=None, action=None):
         visited, expanding, leaves = set(), set(), []
@@ -300,32 +339,43 @@ class ActionPolicy:
             return False
         return self.overrides.get(f"{state.entity_id}:activate") is True and (user is None or bool(getattr(user, "is_admin", False)))
 
-    def catalog(self, user=None, *, for_retrieval=False):
+    def catalog(self, user=None, *, for_retrieval=False, trace=None):
+        def timed(stage, function, *args, **kwargs):
+            if trace is None:
+                return function(*args, **kwargs)
+            started = perf_counter()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                key = f"catalog_{stage}_ms"
+                trace[key] = trace.get(key, 0.0) + (perf_counter() - started) * 1000
+
         result = []
-        for state in self.hass.states.async_all():
+        for state in timed("state", self.hass.states.async_all):
             entity_id = state.entity_id
             if not _permission(user, entity_id, "read"):
                 continue
             domain = entity_id.split(".", 1)[0]
             actions = []
-            group = self._group(state)
-            for action, (label, domains, _, params) in _ACTIONS.items():
+            group = timed("group", self._group, state)
+            for action, (label, domains, _, params) in (_ACTIONS.items() if group else _DOMAIN_ACTIONS.get(domain, ())):
                 if domain not in domains:
                     if not group:
                         continue
                     try:
-                        if not any(x.split(".", 1)[0] in domains for x in self._leaves(entity_id, user=user)):
+                        if not any(x.split(".", 1)[0] in domains for x in timed("group", self._leaves, entity_id, user=user)):
                             continue
                     except ValueError:
                         continue
-                enabled, default = self._enabled(state, action)
+                configured, default = self._enabled(state, action)
+                enabled = configured
                 members = None
-                supported = _capability(state, action)
+                supported = timed("capability", _capability, state, action)
                 if group:
                     try:
-                        members = sorted(set(self._leaves(entity_id, user=user, action=action)))
+                        members = sorted(set(timed("group", self._leaves, entity_id, user=user, action=action)))
                         targets = [self.hass.states.get(member) for member in members]
-                        capabilities = [_capability(target, action) for target in targets]
+                        capabilities = [timed("capability", _capability, target, action) for target in targets]
                         supported = shared_parameters(capabilities) if all(cap is not None for cap in capabilities) else None
                         if params and not supported:
                             supported = None
@@ -335,24 +385,34 @@ class ActionPolicy:
                         enabled = False
                 enabled = enabled and (supported is not None or group and not for_retrieval) and _permission(user, entity_id, "control") and self._scope_ok(state, user)
                 schema = supported if supported is not None else {}
-                item = {"id": action, "label": label, "enabled": enabled, "supported": supported is not None, "configured": self._enabled(state, action)[0], "default_enabled": default, "sensitive": self._sensitive(state) or (domain == "scene" and not default), "parameters": {"type": "object", "properties": schema, "required": list(schema) if action != "light_set" else [], "additionalProperties": False}}
+                item = {"id": action, "label": label, "enabled": enabled, "supported": supported is not None, "configured": configured, "default_enabled": default, "sensitive": self._sensitive(state) or (domain == "scene" and not default), "parameters": {"type": "object", "properties": schema, "required": list(schema) if action != "light_set" else [], "additionalProperties": False}}
                 if for_retrieval and enabled and members:
                     item["members"] = members
                     item["sensitive"] |= any(self._sensitive(target) for target in targets)
                 actions.append(item)
             if actions or domain in {"binary_sensor", "sensor"}:
-                area = self._area(entity_id)
+                area = timed("registry", self._area, entity_id)
                 entity = {"id": entity_id, "name": str(state.attributes.get("friendly_name", entity_id)), "area": area.name if area else None, "state": str(state.state), "actions": actions}
                 if for_retrieval:
-                    entry = self._registry_entry(entity_id)
-                    device_name, floor = self._location_metadata(area, entry)
+                    entry = timed("registry", self._registry_entry, entity_id)
+                    device_name, floor = timed("registry", self._location_metadata, area, entry)
                     entity.update(aliases=[alias for alias in getattr(entry, "aliases", ()) if isinstance(alias, str)], area_aliases=getattr(area, "aliases", ()), area_id=area.id if area else None, registry_id=getattr(entry, "id", None), group=group, device_class=state.attributes.get("device_class"))
+                    live_values = {key: state.attributes[key] for key in ("brightness", "volume_level", "temperature", "percentage_step") if key in state.attributes}
+                    if live_values:
+                        entity["live_values"] = live_values
                     if isinstance(device_name, str) and device_name:
-                        entity["aliases"].append(device_name)
+                        entity.update(device_name=device_name, device_id=getattr(entry, "device_id", None))
                     if floor:
                         entity.update(floor=floor.name, floor_id=floor.floor_id, floor_aliases=floor.aliases)
                 result.append(entity)
         return result
+
+    def basis_matches(self, entity_id, basis):
+        current = self.hass.states.get(entity_id)
+        if current is None:
+            return False
+        value = current.attributes.get(basis[0])
+        return type(value) in (int, float) and value == basis[1] and (len(basis) == 2 or current.state == basis[2])
 
     def _check_leaf(self, entity_id, action, parameters, user):
         target = self.hass.states.get(entity_id)
@@ -367,6 +427,9 @@ class ActionPolicy:
             return "skipped", "action disabled"
         if not valid_parameters(action, parameters, capability):
             return "errors", "invalid parameters for current capabilities"
+        if power := power_permission(action, parameters):
+            if not self._enabled(target, power)[0]:
+                return "skipped", "power action disabled"
         return None
 
     def preflight(self, action, entity_ids, parameters, context, *, user=None, expected_leaves=None):

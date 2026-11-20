@@ -30,7 +30,7 @@ class Policy:
         self.entities = [{"id":"light.room", "name":"Room", "area":None, "state":"off", "actions":[{"id":"turn_on", "enabled":True}, {"id":"unlock", "enabled":False}]}]
         self.calls = []
 
-    def catalog(self, user=None, *, for_retrieval=False):
+    def catalog(self, user=None, *, for_retrieval=False, trace=None):
         return self.entities
 
     def preflight(self, action, entity_ids, parameters, context, *, user=None, expected_leaves=None):

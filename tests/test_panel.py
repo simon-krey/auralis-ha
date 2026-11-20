@@ -1,6 +1,9 @@
 """Offline tests for panel registration."""
 import importlib.util
+import json
 import pathlib
+import shutil
+import subprocess
 import sys
 import types
 import unittest
@@ -50,3 +53,26 @@ class PanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="llm_reasoning"', panel)
         for value in ("default", "on", "off"):
             self.assertIn(f'<option value="{value}">', panel)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for the offline panel test")
+    def test_compound_diagnostics_include_nested_matches_and_rejections(self):
+        name = {"id": "light.hue_go", "heard": "hue go", "method": "exact"}
+        room = {"id": "office", "heard": "buro", "method": "exact"}
+        matches = {"reason": "incomplete_compound_plan", "clauses": [
+            {"names": [name], "rooms": [room], "status": "matched"},
+            {"names": [name], "rooms": [room], "status": "no_action", "rejected_actions": [
+                {"id": name["id"], "action": "light_set", "reason": "policy"},
+                {"id": name["id"], "action": "turn_on", "reason": "unsupported"}]},
+            {"status": "clarify", "reason": "ambiguous_target", "target_spans": [{"reason": "target_type_mismatch"}]},
+        ]}
+        script = "global.HTMLElement = class {}; global.customElements = { get: () => true };\n"
+        script += (ROOT / "panel.js").read_text()
+        script += f"\nconst panel = Object.create(AuralisPanel.prototype); console.log(JSON.stringify(panel.matchFields({json.dumps(matches)})));"
+        output = subprocess.check_output(["node", "-"], input=script, text=True)
+        fields = dict(json.loads(output))
+        self.assertEqual(fields["Erkannte Gerätenamen"], [name])
+        self.assertEqual(fields["Erkannte Räume"], [room])
+        self.assertIn("light.hue_go · light_set: Aktion nicht freigegeben", fields["Teilschritt 2"])
+        self.assertIn("Vom Gerät nicht unterstützt", fields["Teilschritt 2"])
+        self.assertIn("Mehrere passende Geräte", fields["Teilschritt 3"])
+        self.assertIn("Gerätename und Gerätetyp passen nicht zusammen", fields["Teilschritt 3"])

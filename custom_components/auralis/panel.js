@@ -63,6 +63,8 @@ class AuralisPanel extends HTMLElement {
     const s = this._settings;
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) this.$(`#${key}`).value = s[key] || '';
     this.$('#llm_reasoning').value = s.llm_reasoning || 'default';
+    this.$('#llm_plan_approval').value = s.llm_plan_approval || 'multi';
+    this.$('#llm_light_comfort').checked = s.llm_light_comfort === true;
     this.$('#history_enabled').checked = !!s.history_enabled;
     this.$('#llm_full_context').checked = !!s.llm_full_context;
     this.$('#llm_context_budget').value = String(s.llm_context_budget ?? 8000);
@@ -138,6 +140,8 @@ class AuralisPanel extends HTMLElement {
     const settings = {};
     for (const key of ['stt_url', 'stt_model', 'llm_url', 'llm_model', 'system_prompt']) settings[key] = this.$(`#${key}`).value;
     settings.llm_reasoning = this.$('#llm_reasoning').value;
+    settings.llm_plan_approval = this.$('#llm_plan_approval').value;
+    settings.llm_light_comfort = this.$('#llm_light_comfort').checked;
     settings.history_enabled = this.$('#history_enabled').checked;
     settings.llm_full_context = this.$('#llm_full_context').checked;
     settings.llm_context_budget = Number(this.$('#llm_context_budget').value);
@@ -234,7 +238,48 @@ class AuralisPanel extends HTMLElement {
     return value < 1000 ? `${value} ms` : `${(value / 1000).toLocaleString('de-DE', { maximumFractionDigits: 2 })} s`;
   }
   selectionText(selection) {
-    return ({ matched: 'Passende Ziele und Aktionen gefunden', clarify: 'Ziel oder Umfang nicht eindeutig', no_match: 'Kein passendes Ziel mit Aktion', no_action: 'Keine passende freigegebene Aktion', read_only: 'Nur Gerätestatus, keine Aktion', already_set: 'Schon im gewünschten Zustand' })[selection?.status] || '';
+    return ({ matched: 'Passende Ziele und Aktionen gefunden', bounded: 'Begrenzte Aktionsauswahl', clarify: 'Ziel oder Umfang nicht eindeutig', no_match: 'Kein passendes Ziel mit Aktion', no_action: 'Keine passende freigegebene Aktion', read_only: 'Nur Gerätestatus, keine Aktion', already_set: 'Schon im gewünschten Zustand' })[selection?.status] || '';
+  }
+  matchFields(matches) {
+    const clauses = matches.clauses || [];
+    const traces = [matches, ...clauses];
+    const unique = items => [...new Map(items.map(item => [JSON.stringify(item), item])).values()];
+    const collect = key => unique(traces.flatMap(trace => trace[key] || []));
+    const reasons = {
+      read_only_expression: 'Frage, Negation oder Zeitbedingung', unresolved_number_list: 'Nicht aufgelöste Nummernliste',
+      unresolved_room: 'Raum nicht erkannt', unresolved_target: 'Ziel nicht eindeutig erkannt', ambiguous_target: 'Mehrere passende Geräte',
+      target_type_mismatch: 'Gerätename und Gerätetyp passen nicht zusammen', incomplete_compound_plan: 'Nicht alle Teilschritte sind ausführbar',
+      unresolved_reference: 'Bezugsgerät nicht gefunden', ambiguous_reference: 'Mehrere mögliche Bezugsgeräte',
+      unrecognized_command_fragment: 'Teil des Befehls nicht erkannt', missing_ambiguous_or_unsupported_parameters: 'Parameter fehlen, sind mehrdeutig oder werden vom Gerät nicht unterstützt',
+      incomplete_bounded_choices: 'Nicht alle Alternativen wurden sicher aufgelöst', subjective_value_not_configured: 'Keine eindeutige Einstellung für diese Beschreibung',
+      live_value_unsupported_or_ambiguous: 'Kein gültiger Gerätewert für die relative Änderung',
+      mixed_power_and_parameter_scope: 'Schalten und Einstellen bitte als getrennte Teilschritte angeben',
+      power_action_disabled: 'Die zugehörige Ein- oder Ausschaltaktion ist nicht freigegeben',
+      unknown_voice_area: 'Das Sprachgerät hat keinen bekannten Raum', unresolved_repeat_action: 'Vorherige Aktion oder neuer Raum nicht eindeutig',
+      unsupported: 'Vom Gerät nicht unterstützt', policy: 'Aktion nicht freigegeben', approximate_sensitive: 'Unscharfer Treffer für eine sensible Aktion',
+    };
+    const describe = reason => Object.hasOwn(reasons, reason) ? reasons[reason] : reason;
+    const issues = trace => unique([
+      trace.reason && describe(trace.reason),
+      ...(trace.target_spans || []).map(span => span.reason && describe(span.reason)),
+      ...(trace.rejected_actions || []).map(item => `${item.id} · ${item.action}: ${describe(item.reason)}`),
+      trace.unresolved_words?.length && `Nicht verstanden: ${trace.unresolved_words.join(', ')}`,
+    ].filter(Boolean));
+    const fields = [['Erkannte Räume', collect('rooms')], ['Erkannte Gerätenamen', collect('names')]];
+    const qualifiers = collect('domain_qualifiers');
+    if (qualifiers.length) fields.push(['Gerätetypen im Befehl', qualifiers]);
+    const intents = collect('action_hints');
+    if (intents.length) fields.push(['Erkannte Aktionshinweise', intents]);
+    const rootIssues = issues(matches);
+    if (rootIssues.length) fields.push(['Grund der lokalen Auswahl', rootIssues.join(' · ')]);
+    for (const [index, clause] of clauses.entries()) {
+      const clauseIssues = issues(clause);
+      if (!clause.text && !clauseIssues.length && ['matched', 'already_set'].includes(clause.status)) continue;
+      fields.push([`Teilschritt ${index + 1}`, [clause.text, this.selectionText(clause), ...clauseIssues].filter(Boolean).join(' · ')]);
+    }
+    const skipped = collect('skipped_groups');
+    if (skipped.length) fields.push(['Übersprungene Gruppen', skipped]);
+    return fields;
   }
   offeredActions(selection) {
     return (selection?.offered_actions ?? Object.keys(selection?.action_parameters || {})).join(', ') || 'keine';
@@ -286,18 +331,19 @@ class AuralisPanel extends HTMLElement {
     if (Number.isFinite(details.audio_bytes)) values.push(['Audio', `${details.audio_bytes.toLocaleString('de-DE')} Bytes${details.audio_format ? ` · ${details.audio_format}` : ''}`]);
     if (selection) {
       values.push(['Modus', selection.mode], ['Vollständiger passender Umfang', selection.matched_scope], ['Lokale Auswahl', selection.entities], ['Katalog im Modellkontext', selection.catalog_entities], ['Aktive Aktionen', selection.active_actions ?? selection.action_parameters]);
-      if (selection.matches) {
-        values.push(['Erkannte Räume', selection.matches.rooms], ['Erkannte Gerätenamen', selection.matches.names]);
-        const reason = { read_only_expression: 'Frage, Negation oder Zeitbedingung', unresolved_number_list: 'Nicht aufgelöste Nummernliste', unresolved_room: 'Raum nicht erkannt', unresolved_target: 'Ziel nicht eindeutig erkannt' }[selection.matches.reason];
-        if (reason) values.push(['Grund der lokalen Auswahl', reason]);
-        if (selection.matches.skipped_groups?.length) values.push(['Übersprungene Gruppen', selection.matches.skipped_groups]);
-      }
+      values.push(['Resolver-Modus', selection.resolution_mode], ['Werkzeugstrategie', selection.strategy], ['Aktionsplan', selection.plan], ['Aktionsalternativen', selection.candidates], ['Werkzeugdefinitionen', selection.offered_tools]);
+      if (selection.matches) values.push(...this.matchFields(selection.matches));
+      if (selection.parameters_validated) values.push(['Parameterprüfung', 'Bestanden']);
+      if (selection.preflight_passed) values.push(['Berechtigungs- und Fähigkeitsprüfung', 'Bestanden']);
+      if (selection.preflight_failed) values.push(['Ausführungsprüfung fehlgeschlagen', selection.preflight_failed]);
       if (selection.resolved_targets?.length) values.push(['Lokal aufgelöste Sammelziele', selection.resolved_targets]);
     }
+    if (details.local_timings_ms) values.push(['Lokale Phasen (ms)', details.local_timings_ms]);
     for (const [index, round] of (details.requests || []).entries()) {
       const parts = [this.duration(round.duration_ms)];
       if (typeof round.offered_tools === 'boolean') parts.push(round.offered_tools ? 'Werkzeug angeboten' : 'kein Werkzeug angeboten');
       if (Number.isFinite(round.tool_calls)) parts.push(`${round.tool_calls} Werkzeugaufrufe angefordert`);
+      if (round.selected_tools?.length) parts.push(round.selected_tools.join(', '));
       if (round.failed) parts.push('fehlgeschlagen');
       if (round.usage) parts.push(`${[Number.isFinite(round.usage.prompt_tokens) && `${round.usage.prompt_tokens} Eingabe`, Number.isFinite(round.usage.completion_tokens) && `${round.usage.completion_tokens} Ausgabe`, Number.isFinite(round.usage.total_tokens) && `${round.usage.total_tokens} gesamt`].filter(Boolean).join(' / ')} Tokens`);
       timeline.push({ start: round.started_ms, sequence: round.sequence, title: `API-Anfrage ${index + 1}`, value: parts.filter(Boolean).join(' · '), round });
@@ -478,6 +524,8 @@ class AuralisPanel extends HTMLElement {
         <div class="grid">
       <section class="card"><div class="card-head"><p class="eyebrow">01 / Verbindung</p><h2>Dienste & Einstellungen</h2><p class="muted">Änderungen gelten nach dem Speichern.</p></div><p id="destinations" class="notice"></p><form id="settings"><h3 class="subheading">Spracheingabe · STT</h3><div class="fields"><label class="field">STT-URL<input id="stt_url" type="url" autocomplete="off"></label><label class="field">Modell<input id="stt_model" autocomplete="off"></label><label class="field">Token <span id="stt_token_state" class="meta"></span><select id="stt_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues STT-Token<input id="stt_token" type="password" autocomplete="new-password" disabled></label></div><h3 class="subheading">Verarbeitung · LLM</h3><div class="fields"><label class="field">LLM-Basis-URL<input id="llm_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off"></label><label class="field">Modell<input id="llm_model" list="llm_models" aria-describedby="model_status" autocomplete="off"><datalist id="llm_models"></datalist></label><label class="field">Token <span id="llm_token_state" class="meta"></span><select id="llm_token_mode"><option value="keep">Beibehalten</option><option value="replace">Ersetzen</option><option value="clear">Löschen</option></select></label><label class="field">Neues LLM-Token<input id="llm_token" type="password" autocomplete="new-password" disabled></label><div class="wide model-controls"><button id="load_models" type="button">Modelle laden</button><p id="model_status" class="meta" role="status"></p></div>
       <label class="field wide">Reasoning (Thinking)<select id="llm_reasoning" aria-describedby="llm_reasoning_help"><option value="default">Anbieterstandard</option><option value="on">An</option><option value="off">Aus</option></select><small id="llm_reasoning_help">An und Aus setzen Unterstützung für reasoning_effort voraus. Bei Fehlern Anbieterstandard wählen.</small></label>
+      <label class="field wide">Aktionsplan bestätigen<select id="llm_plan_approval"><option value="multi">Bisherige Werkzeuge</option><option value="single">Gesamten Plan einmal bestätigen</option></select></label>
+      <label class="field wide"><span><input id="llm_light_comfort" type="checkbox"> „Gemütlicher“ bei Licht als begrenzte Auswahl zulassen</span><small>Das Modell darf 30 % oder Warmweiß (2700 K) wählen, wenn beide Optionen unterstützt und erlaubt sind.</small></label>
       <label class="checkrow wide"><input id="llm_full_context" type="checkbox" aria-describedby="llm_full_context_help"> Alle Geräte an das LLM senden</label><p id="llm_full_context_help" class="meta wide">Sendet freigegebene Geräte und Aktionen an den eingestellten LLM-Endpunkt.</p>
       <label class="field wide">LLM-Kontextbudget<select id="llm_context_budget" aria-describedby="llm_context_budget_help"><option value="8000">8.000 Tokens (empfohlen)</option><option value="16000">16.000 Tokens</option></select><small id="llm_context_budget_help">Schätzwert inklusive Antwort. Passt der Vollkatalog nicht hinein, greift die lokale Auswahl.</small></label>
       <label class="field wide">System-Prompt<textarea id="system_prompt"></textarea></label><label class="checkrow wide"><input id="history_enabled" type="checkbox"> Verlauf speichern</label></div><p class="meta">Der Verlauf kann Texte, Werkzeugaufrufe und Aufnahmen enthalten.</p><button id="save" class="primary" type="submit">Einstellungen speichern</button></form></section>

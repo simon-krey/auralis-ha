@@ -27,7 +27,7 @@ class AuralisConversation(ConversationEntity):
         try:
             if user_id and (user is None or not user.is_active):
                 raise ValueError("Benutzer nicht verfügbar")
-            result = await self.bridge.chat(user_input.text, user_input.language, user_input.context, user, memory_key=memory_key)
+            result = await self.bridge.chat(user_input.text, user_input.language, user_input.context, user, memory_key=memory_key, voice_origin=(device_id, satellite_id))
             response.async_set_speech(result["answer"])
         except ValueError:
             response.async_set_error(intent.IntentResponseErrorCode.FAILED_TO_HANDLE, "Die Anfrage konnte nicht verarbeitet werden.")

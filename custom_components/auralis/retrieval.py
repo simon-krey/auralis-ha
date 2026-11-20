@@ -2,7 +2,10 @@
 
 import re
 from difflib import SequenceMatcher
+from functools import lru_cache
+from time import perf_counter
 
+from .actions import _ACTIONS
 from .names import EXPLICIT_LOCATION, MATCH_METHODS, match_names, normalize, number_words, remove_location
 
 BULK_TARGET = "__all_matching__"
@@ -41,12 +44,12 @@ _QUESTION = re.compile(r"^(?:ist|sind|war|was|welch\w*|wie|wo|is|are|what|which|
 _ACTION_WORDS = {
     "turn_on": r"ein ?schalt\w*|an ?schalt\w*|an ?mach\w*|turn on|switch on|(?:an|ein|on)(?= *(?:bitte|please)?(?:$| (?:und|and|im|in)\b))",
     "turn_off": r"aus ?schalt\w*|abschalt\w*|aus ?mach\w*|turn off|switch off|(?:aus|off)(?= *(?:bitte|please)?(?:$| (?:und|and|im|in)\b))",
-    "light_set": r"dimm\w*|heller|dunkler|helligkeit|brightness|brighter|darker|farb\w*|color|colour|rot|blau|grun|gruen|gelb|weiss|lila|orange|red|blue|green|yellow|white|purple|warmweiss|kaltweiss|warmer|kalter|cooler|white balance",
+    "light_set": r"dimm\w*|heller|dunkler|helligkeit|brightness|brighter|darker|farb\w*|color|colour|rot|blau|grun|gruen|gelb|weiss|lila|orange|turkis|tuerkis|turquoise|red|blue|green|yellow|white|purple|warmweiss|kaltweiss|warmer|kalter|cooler|white balance",
     "activate": r"aktivier\w*|activate|starte?n?|start|ausfuhr\w*|execute|run",
     "open": r"offn\w*|oeffn\w*|offen|hochfahr\w*|hoch|open|raise",
     "close": r"schliess\w*|runterfahr\w*|herunter|runter|zu\s*machen|close|lower",
     "stop": r"halt\w*|stopp?\w*",
-    "unlock": r"entriegel\w*|aufschliess\w*|unlock",
+    "unlock": r"entriegel\w*|entriegl\w*|aufschliess\w*|unlock",
     "lock": r"verriegel\w*|abschliess\w*|lock(?= (?:the|my))",
     "climate_temperature": r"grad|degrees?|temperatur|temperature|warmer|kalter|cooler",
     "climate_hvac_mode": r"heizmodus|kuhlmodus|hvac|heat mode|cool mode",
@@ -76,7 +79,45 @@ _UNSUPPORTED_SCOPE = re.compile(r"\b(?:entweder|either|oder|or|samt|sowie|plus|z
 _MEASURE_WORDS = re.compile(r"\b\d+(?: \d+)? (?:prozent|percent|grad|degrees?|kelvin)\b")
 
 
-def _target_spans(text, names, generic, *, german):
+def _without_names(text, matches):
+    phrases = {phrase for group in matches.values() for _, phrase in group}
+    for phrase in sorted(phrases, key=lambda phrase: (-len(phrase), phrase)):
+        text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text)
+    return " ".join(text.split())
+
+
+def _constrain_matches(text, matches, entities, device_names):
+    if not matches:
+        return matches, None
+    residue = _without_names(text, matches)
+    qualifier_text = re.sub(r"^(?:(?:please|bitte) )?(?:switch|lock) ", "", residue)
+    for pattern in _ACTION_PATTERNS.values():
+        qualifier_text = pattern.sub(" ", qualifier_text)
+    qualifiers = set(qualifier_text.split()) & _DOMAINS.keys()
+    domains = {_DOMAINS[word] for word in qualifiers}
+    if domains:
+        compatible = {target: evidence for target, evidence in matches.items() if _matches_domain(entities[target], domains, qualifiers)}
+        if len(domains) != 1 or not compatible:
+            return matches, "target_type_mismatch"
+        return compatible, None
+
+    shared = {(entities[target].get("device_id"), device_names.get(target)) for target in matches}
+    if len(matches) < 2 or len(shared) != 1:
+        return matches, None
+    device_id, device_name = next(iter(shared))
+    if not device_id or not device_name or not all((0, device_name) in evidence for evidence in matches.values()):
+        return matches, None
+    power = [action for action in ("turn_on", "turn_off") if _ACTION_PATTERNS[action].search(residue)]
+    if len(power) == 1:
+        related = ("activate", "vacuum_start") if power[0] == "turn_on" else ("media_stop", "vacuum_pause")
+        domains = set().union(*(_ACTIONS[action][1] for action in (*power, *related)))
+        compatible = {target: evidence for target, evidence in matches.items() if _domain(entities[target]) in domains}
+        if compatible:
+            return compatible, None
+    return matches, None
+
+
+def _target_spans(text, names, generic, *, german, entities, device_names, trace):
     exact = match_names(text, names, generic=generic, german=german)
     protected = {phrase for group in exact.values() for method, phrase in group if method < 2}
     boundaries = [item for item in _COORDINATOR.finditer(text) if not any(
@@ -85,15 +126,20 @@ def _target_spans(text, names, generic, *, german):
         for match in re.finditer(rf"\b{re.escape(phrase)}\b", text)
     )]
     if not boundaries:
-        return exact, [], False
+        found, reason = _constrain_matches(text, exact, entities, device_names)
+        if reason and trace is not None:
+            trace["reason"] = reason
+        return found, [], bool(reason)
     matches, spans, incomplete = {}, [], False
     start = 0
     for boundary in [*boundaries, None]:
         end = boundary.start() if boundary else len(text)
         expression = text[start:end].strip()
-        found = match_names(expression, names, generic=generic, german=german)
-        spans.append({"start": start, "end": end, "expression": expression, "candidates": sorted(found), "status": "resolved" if len(found) == 1 else "ambiguous" if found else "unresolved"})
-        if len(found) != 1:
+        found, reason = _constrain_matches(expression, match_names(expression, names, generic=generic, german=german), entities, device_names)
+        spans.append({"start": start, "end": end, "expression": expression, "candidates": sorted(found), "status": "unresolved" if reason or not found else "resolved" if len(found) == 1 else "ambiguous"})
+        if reason:
+            spans[-1]["reason"] = reason
+        if reason or len(found) != 1:
             incomplete = True
         for target, evidence in found.items():
             matches.setdefault(target, set()).update(evidence)
@@ -127,13 +173,25 @@ def _matches_domain(entity, domains, words):
     return True
 
 
-def select_context(prompt, catalog, *, trace=None, language="de", strict=False, keep_noops=False):
+@lru_cache(maxsize=4096)
+def _normalized_alias(value, german):
+    normalized = normalize(value)
+    return number_words(normalized) if german else normalized
+
+
+def select_context(prompt, catalog, *, trace=None, language="de", strict=False, keep_noops=False, timings=None):
     german = (language or "de").lower().split("-")[0].split("_")[0] == "de"
     def normalize_name(value):
-        normalized = normalize(value)
-        return number_words(normalized) if german else normalized
+        if len(value) <= 256:
+            return _normalized_alias(value, german)
+        return number_words(normalize(value)) if german else normalize(value)
 
-    original = normalize_name(prompt)
+    def measured(stage, started):
+        if timings is not None:
+            timings[stage] = timings.get(stage, 0.0) + (perf_counter() - started) * 1000
+
+    original = number_words(normalize(prompt)) if german else normalize(prompt)
+    aliases_started = perf_counter()
     rooms = {}
     for entity in catalog:
         if entity["area"]:
@@ -144,7 +202,10 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     prefix_lengths = sorted({len(phrase) for phrase in room_prefixes})
     compounds = {word: f"{word[:split]} {word[split:]}" for word in set(original.split()) for split in prefix_lengths if word[:split] in room_prefixes and word[split:] in _DOMAINS}
     text = " ".join(compounds.get(word, word) for word in original.split())
+    measured("alias_normalization_ms", aliases_started)
+    matching_started = perf_counter()
     area_matches = match_names(text, rooms, rooms=True, german=german)
+    measured("entity_matching_ms", matching_started)
     areas = set(area_matches)
     room_phrases = {phrase for matches in area_matches.values() for _, phrase in matches}
     named_text = original
@@ -155,12 +216,22 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     if domains & {"climate", "light"} and not words & {"sensor", "sensoren"}:
         domains.discard("sensor")
     scoped = [entity for entity in catalog if not areas or ("area", entity.get("area_id", entity["area"])) in areas or ("floor", entity.get("floor_id")) in areas]
+    scoped_by_id = {entity["id"]: entity for entity in scoped}
+    aliases_started = perf_counter()
+    device_names = {entity["id"]: normalize_name(entity["device_name"]) for entity in scoped if entity.get("device_name")}
     names = {entity["id"]: {normalize_name(value) for value in (entity["name"], entity["id"], *entity.get("aliases", ()))} for entity in scoped}
+    for target, device_name in device_names.items():
+        names[target].add(device_name)
+    measured("alias_normalization_ms", aliases_started)
     generic = _DOMAINS.keys() | room_phrases
-    matches, spans, incomplete = _target_spans(named_text, names, generic, german=german)
+    matching_started = perf_counter()
+    matches, spans, incomplete = _target_spans(" ".join(named_text.split()), names, generic, german=german, entities=scoped_by_id, device_names=device_names, trace=trace)
+    measured("entity_matching_ms", matching_started)
     specific = {phrase for group in matches.values() for _, phrase in group}
     named = [entity for entity in scoped if entity["id"] in matches]
     if trace is not None:
+        if strict and domains:
+            trace["domain_qualifiers"] = sorted(domains)
         for key, found in (("rooms", area_matches), ("names", matches)):
             trace[key] = [{"id": target[1] if key == "rooms" else target, "heard": phrase, "method": MATCH_METHODS[method]} for target, group in sorted(found.items())[:20] for method, phrase in [min(group)]]
         if spans:
@@ -173,8 +244,9 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
             ][:50]
     global_scope = bool(_GLOBAL.search(text))
     explicit_all = bool(_ALL.search(text))
-    room_command = named_text
+    room_command = text
     for phrase in sorted(room_phrases, key=len, reverse=True):
+        room_command = remove_location(room_command, phrase)
         room_command = re.sub(rf"\b{re.escape(phrase)}\b", " ", room_command)
     room_command = _COURTESY.sub("", " ".join(room_command.split()))
     room_command = " ".join(word for word in room_command.split() if word not in {"bitte", "please", "mal", "kurz", "mir"})
@@ -201,6 +273,8 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
         hints.update({"light_set", "fan_set_percentage", "set_position", "volume_set", "set_value"})
     if strict and "kelvin" in words:
         hints.add("light_set")
+    if trace is not None and strict:
+        trace["action_hints"] = sorted(hints)
     if "light_set" in hints and "turn_off" not in hints:
         hints.discard("turn_on")
     if _QUESTION.search(text) or _EXCEPTION.search(text) or _DEFERRED.search(action_text):
@@ -208,6 +282,12 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
             trace["reason"] = "read_only_expression"
         return candidates, {}, [], "read_only"
     action_words = set(action_text.split())
+    if strict and hints & {"light_set", "climate_temperature", "volume_set", "fan_set_percentage", "set_position"} and (
+        action_words & {"an", "aus", "on", "off"} or re.search(r"\bein (?:auf|to)\b", action_text)
+    ):
+        if trace is not None:
+            trace["reason"] = "mixed_power_and_parameter_scope"
+        return candidates, {}, [], "clarify"
     if strict and (_UNSUPPORTED_SCOPE.search(action_text) or _LOCAL_QUALIFIER.search(action_text) or (action_words & {"an", "on", "ein"} and action_words & {"aus", "off"})):
         if trace is not None:
             trace["reason"] = "unsupported_scope"
@@ -227,7 +307,7 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
     coordinated = bool(spans and named)
     if incomplete and (strict or coordinated and not bulk):
         if trace is not None:
-            trace["reason"] = "incomplete_target_set"
+            trace.setdefault("reason", "incomplete_target_set")
         return candidates, {}, [], "clarify"
     # Only unmatched words suggest an unknown target; never turn these suggestions into actions.
     if not named and (hints or explicit_all or domains or areas):
@@ -261,6 +341,8 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
             trace["skipped_groups"] = [entity["id"] for entity in candidates if entity.get("group")]
         candidates = [entity for entity in candidates if not entity.get("group")]
     elif explicit_all or (len(candidates) > 1 and not coordinated) or (not areas and not named and re.search(r"\b(?:im|in|am|bei|neben)\b", text)):
+        if trace is not None and len(candidates) > 1:
+            trace.setdefault("reason", "ambiguous_target")
         return candidates, {}, [], "clarify"
     elif domains == {"light"} and not areas and not named and hints & {"turn_on", "turn_off"} and not _GENERIC_LIGHT_SWITCH.fullmatch(text):
         return [], {}, [], "clarify"
@@ -274,13 +356,15 @@ def select_context(prompt, catalog, *, trace=None, language="de", strict=False, 
         for pattern in _ACTION_PATTERNS.values():
             remainder = pattern.sub(" ", remainder)
         residue = set(remainder.split())
-        mentioned = {_DOMAINS[word] for word in residue & _DOMAINS.keys()}
-        if residue - _TARGET_GRAMMAR or mentioned and named and any(_domain(entity) not in mentioned for entity in named):
+        if residue - _TARGET_GRAMMAR:
             if trace is not None:
                 trace["reason"] = "unrecognized_command_fragment"
+                trace["unresolved_words"] = sorted(residue - _TARGET_GRAMMAR)
             return candidates, {}, [], "clarify"
     approximate = any(min(group)[0] >= 2 for group in (*area_matches.values(), *matches.values()))
+    filtering_started = perf_counter()
     actions = {entity["id"]: {item["id"]: item.get("parameters", {}) for item in entity["actions"] if item.get("enabled") is True and item["id"] in hints and not (approximate and item.get("sensitive"))} for entity in candidates}
+    measured("capability_policy_filter_ms", filtering_started)
     if trace is not None and strict:
         trace["rejected_actions"] = [{"id": entity["id"], "action": item["id"], "reason": "unsupported" if item.get("supported") is False else "policy" if not item.get("enabled") else "approximate_sensitive"} for entity in candidates for item in entity["actions"] if item["id"] in hints and item["id"] not in actions[entity["id"]]][:50]
     if not bulk and not (coordinated and len(candidates) > 1):

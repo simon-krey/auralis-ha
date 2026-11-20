@@ -1,21 +1,30 @@
 """Build a complete, locally bound action plan before exposing model tools."""
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 import re
+from time import perf_counter
 
-from .actions import _ACTIONS, shared_parameters, valid_parameters
+from .actions import _ACTIONS, power_permission, shared_parameters, valid_parameters
 from .names import contains, normalize
 from .retrieval import BULK_TARGET, _ACTION_PATTERNS, _DEFERRED, _EXCEPTION, _QUESTION, _TARGET_GRAMMAR, select_context
+from .voice_values import value_expression
 
 MAX_STEPS = 8
 _SEPARATOR = re.compile(r"\b(?:und|and|dann|then)\b|;", re.I)
-_VERB = re.compile(r"^(?:und |and )?(?:dann |then )?(?:schalt\w*|mach\w*|stell\w*|dimm\w*|turn|switch|make|set|dim|open|close|offne|schliesse|activate|starte|start|stop|pause)\b")
+_COLOR_OWNER = r"ihre|seine|deren|dessen|its"
+_COLOR_NOUN = r"farbe|color|colour"
+_VERB = re.compile(rf"^(?:und |and )?(?:dann |then )?(?:schalt\w*|mach\w*|stell(?:e)?|setze|dimm\w*|turn|switch|make|set|dim|open|close|offne|schliesse|activate|starte|start|stop|pause|(?:(?:ver)?a(?:e)?ndere|change)(?= (?:die|the|{_COLOR_OWNER}) (?:{_COLOR_NOUN})\b))\b")
 _NUMBER = r"[-+]?\d+(?:[.,]\d+)?"
 _MEASURE = re.compile(rf"(?<![\w.,])({_NUMBER})\s*(%|prozent\b|percent\b|grad\b|degrees?\b|kelvin\b)", re.I)
 _ENDING = re.compile(r"(?:\b(?:an|ein|aus|on|off)\s*[.!?]*$|\b(?:auf|to)\s+[-+]?\d|\b(?:rot|red|blau|blue|grün|green|gelb|yellow|weiß|white|purple|lila|orange)\s*[.!?]*$)", re.I)
 _BARE_SWITCH = re.compile(r"^\s*(?:on|off)\b", re.I)
-_REFERENCE = re.compile(r"\b(?:mach\w*|stell\w*|schalt\w*|dimm\w*|make|set|dim|turn|switch) (?:sie|es|ihn|it|them|beide|both)\b|^(?:(?:und|and) )?(?:jetzt |now )?(?:auf|to) \d")
-_PRONOUN = re.compile(r"\b(?:sie|es|ihn|it|them|beide|both)\b", re.I)
+_REFERENCE_WORD = r"sie|es|ihn|it|them|(?:die )?beiden?|both"
+_REFERENCE = re.compile(rf"\b(?:mach\w*|stell(?:e)?|setze|schalt\w*|dimm\w*|make|set|dim|turn|switch) (?:{_REFERENCE_WORD})\b|^(?:(?:und|and) )?(?:jetzt |now )?(?:auf|to) \d")
+_PRONOUN = re.compile(rf"\b(?:{_REFERENCE_WORD})\b", re.I)
+_COLOR_REQUEST = re.compile(rf"^(?:(?:ver)?(?:ä|ae)ndere|change|setze|stell(?:e)?|set)\s+(?:(?P<possessive>{_COLOR_OWNER})|die|the)\s+(?:{_COLOR_NOUN})\s+(?P<body>.+)$", re.I)
+_COLOR_OBJECT = re.compile(r"^(?:der|des|von|of)(?:\s+the)?\s+(?P<target>.+)\s+(?:auf|to)\s+(?P<value>.+)$", re.I)
+_COLOR_VALUE = re.compile(r"^(?:auf|to)\s+(.+)$", re.I)
 _EXCLUSION = re.compile(r"\b(?:außer|ausser|ausgenommen|except|bis auf)\b", re.I)
 _LEAVE = re.compile(r"\b(?:aber lass(?:e)?|but leave)\b", re.I)
 _TRAILING_SWITCH = re.compile(r"\s+(an|ein|aus|on|off)[.!?]*$", re.I)
@@ -23,8 +32,9 @@ _RELATIVE = re.compile(r"\b(?:heller|dunkler|warmer|k[äa]lter|lauter|leiser|bri
 _COLORS = {word: color for words, color in (
     ("rot red", [255, 0, 0]), ("blau blue", [0, 0, 255]), ("grun gruen green", [0, 128, 0]),
     ("gelb yellow", [255, 255, 0]), ("weiss white", [255, 255, 255]),
-    ("lila purple", [128, 0, 128]), ("orange", [255, 165, 0]),
+    ("lila purple", [128, 0, 128]), ("orange", [255, 165, 0]), ("turkis tuerkis turquoise", [64, 224, 208]),
 ) for word in words.split()}
+_WHITE_TONES = frozenset({"warmweiss", "kaltweiss", "warm white", "cool white", "cold white"})
 
 
 @dataclass
@@ -34,6 +44,7 @@ class ActionCandidate:
     schema: dict
     parameters: dict
     scope: list[str]
+    state_basis: tuple = ()
 
     @property
     def targets(self):
@@ -41,6 +52,22 @@ class ActionCandidate:
 
     def diagnostic(self):
         return {"action": self.action, "targets": self.targets, "parameters": self.parameters, "scope": self.scope}
+
+
+class ResolutionMode(StrEnum):
+    DETERMINISTIC = "deterministic"
+    BOUNDED = "bounded"
+    CLARIFICATION = "clarification"
+    NO_ACTION = "no_action"
+
+
+@dataclass(frozen=True)
+class BoundedChoice:
+    id: str
+    action: ActionCandidate
+
+    def diagnostic(self):
+        return self.action.diagnostic() | {"choice": self.id, "constraints": self.action.schema}
 
 
 @dataclass
@@ -52,6 +79,18 @@ class Resolution:
     steps: list[ActionCandidate] = field(default_factory=list)
     trace: dict = field(default_factory=dict)
     adaptive: bool = False
+    choices: tuple[BoundedChoice, ...] = ()
+    mode: ResolutionMode = field(init=False)
+
+    def __post_init__(self):
+        if self.choices:
+            self.mode = ResolutionMode.BOUNDED
+        elif self.steps:
+            self.mode = ResolutionMode.DETERMINISTIC
+        elif self.status in {"clarify", "no_match"}:
+            self.mode = ResolutionMode.CLARIFICATION
+        else:
+            self.mode = ResolutionMode.NO_ACTION
 
 
 def _parts(prompt, catalog):
@@ -62,10 +101,11 @@ def _parts(prompt, catalog):
         before, after = prompt[start:separator.start()], prompt[separator.end():]
         marker = separator.group().lower()
         elliptical_switch = marker == "and" and _BARE_SWITCH.match(after) and re.search(r"\b(?:turn|switch)\b", before, re.I)
-        if marker in {"dann", "then", ";"} or elliptical_switch or _VERB.match(normalize(after)) or (_ENDING.search(before) and _ENDING.search(after)):
+        if (marker in {"dann", "then", ";"} or elliptical_switch or _VERB.match(normalize(after))
+            or (_ENDING.search(value_expression(before.strip())[0]) and _ENDING.search(value_expression(after.strip())[0]))):
             if marker != ";":
                 if aliases is None:
-                    aliases = {normalize(value) for entity in catalog for value in (entity["name"], *entity.get("aliases", ())) if _SEPARATOR.search(value)}
+                    aliases = {normalize(value) for entity in catalog for value in (entity["name"], entity.get("device_name", ""), *entity.get("aliases", ())) if _SEPARATOR.search(value)}
                 if any(left and right and f" {normalize(before)}".endswith(f" {left}") and f"{normalize(after)} ".startswith(f"{right} ")
                        for alias in aliases if f" {marker} " in alias for left, right in [alias.split(f" {marker} ", 1)]):
                     continue
@@ -131,13 +171,38 @@ def _unknown_parameter_words(text):
     return set(text.split()) - _TARGET_GRAMMAR
 
 
-def _part(prompt, catalog, language, reference, *, keep_noops=False):
+def _part(prompt, catalog, language, reference, *, previous_clause=False, keep_noops=False, timings=None):
     trace = {}
+    property_request = _COLOR_REQUEST.fullmatch(prompt.strip())
+    if property_request:
+        subject = _COLOR_OBJECT.fullmatch(property_request["body"]) if not property_request["possessive"] else None
+        value = _COLOR_VALUE.fullmatch(property_request["body"])
+        color = normalize(subject["value"] if subject else value[1] if value else "")
+        if color not in _COLORS and color not in _WHITE_TONES:
+            return Resolution("clarify", [], trace={"reason": "missing_ambiguous_or_unsupported_parameters" if subject or value else "unrecognized_color_request"})
+        if subject:
+            prompt = f"set {subject['target']} color to {color}"
+        elif value:
+            if not reference or not (property_request["possessive"] or previous_clause):
+                return Resolution("clarify", [], trace={"reason": "unresolved_reference"})
+            if len(reference) != 1:
+                return Resolution("clarify", [], trace={"reason": "ambiguous_reference"})
+            antecedents = [entity for entity in catalog if entity["id"] == reference[0] and entity["state"] not in {"unknown", "unavailable"}]
+            if not antecedents or antecedents[0].get("group"):
+                return Resolution("clarify", [], trace={"reason": "unresolved_reference"})
+            catalog = antecedents
+            prompt = f"set {reference[0]} color to {color}"
+            trace["reference"] = list(reference)
+    if reference and re.match(r"^(?:dimme|dim) auf\b", prompt, re.I):
+        prompt = re.sub(r"^(?:dimme|dim) ", "dim it ", prompt, count=1, flags=re.I)
+    if reference and (normalize(prompt) in _COLORS or normalize(prompt) in _WHITE_TONES):
+        prompt = f"set it to {prompt}"
+    prompt, live_value = value_expression(prompt, allow_context=bool(reference))
     text = normalize(prompt)
     if _REFERENCE.search(text):
         if not reference:
             return Resolution("clarify", [], trace={"reason": "unresolved_reference"})
-        if re.search(r"\b(?:beide|both)\b", text) and len(reference) != 2:
+        if re.search(r"\b(?:beiden?|both)\b", text) and len(reference) != 2:
             return Resolution("clarify", [], trace={"reason": "ambiguous_reference"})
         if re.search(r"\b(?:it|es|ihn)\b", text) and len(reference) != 1:
             return Resolution("clarify", [], trace={"reason": "ambiguous_reference"})
@@ -151,14 +216,17 @@ def _part(prompt, catalog, language, reference, *, keep_noops=False):
     prompt = re.sub(r"\s*,\s*(?:und|and)\s+", " and ", prompt, flags=re.I)
     prompt = re.sub(r"(?<!\d),|,(?!\d)", " and ", prompt)
     spoken = re.sub(r"(?<=\d)\s*%", " percent", prompt)
-    entities, enabled, bulk, status = select_context(spoken, catalog, trace=trace, language=language, strict=True, keep_noops=keep_noops)
-    result = Resolution(status, entities, enabled, bulk, trace=trace)
+    entities, enabled, bulk, status = select_context(spoken, catalog, trace=trace, language=language, strict=True, keep_noops=keep_noops, timings=timings)
     if status != "matched":
-        return result
+        if status == "no_action" and re.search(r"\b(?:gemutlicher|gemuetlicher|gemutlich|gemuetlich|cosier|cozier)\b", text):
+            return Resolution("clarify", entities, trace=trace | {"reason": "subjective_value_not_configured"})
+        return Resolution(status, entities, enabled, bulk, trace=trace)
     targets = bulk or [entity["id"] for entity in entities]
     if len(enabled) != 1:
         return Resolution("clarify", entities, trace=trace | {"reason": "ambiguous_action"})
     action = next(iter(enabled))
+    if property_request and action != "light_set":
+        return Resolution("clarify", entities, trace=trace | {"reason": "ambiguous_action"})
     scope = [item["id"] for item in trace.get("scope", [])] or targets
     target_set = set(targets)
     chosen = {entity["id"]: entity for entity in catalog if entity["id"] in target_set}
@@ -166,21 +234,37 @@ def _part(prompt, catalog, language, reference, *, keep_noops=False):
     schema = shared_parameters([item.get("parameters", {}).get("properties", {}) for item in specs.values()])
     if _ACTIONS[action][3] and not schema:
         return Resolution("clarify", entities, trace=trace | {"reason": "no_common_parameter_schema"})
-    parameters = _parameter_values(action, prompt, trace, schema)
+    basis = ()
+    if live_value:
+        key = live_value.parameter
+        value = live_value.apply(chosen[targets[0]], schema[key]) if len(targets) == 1 and not bulk and key in schema else None
+        if value is None or keep_noops and live_value.parameter != "percentage":
+            return Resolution("clarify", entities, trace=trace | {"reason": "live_value_unsupported_or_ambiguous"})
+        parameter, basis = value
+        parameters = {key: parameter}
+        trace["value_source"] = basis[0]
+    else:
+        parameters = _parameter_values(action, prompt, trace, schema)
     if parameters is None or not valid_parameters(action, parameters, schema):
         return Resolution("clarify", entities, trace=trace | {"reason": "missing_ambiguous_or_unsupported_parameters"})
     members = {target: tuple(item.get("members", (target,))) for target, item in specs.items()}
     leaves = [leaf for group in members.values() for leaf in group]
     if len(leaves) != len(set(leaves)):
         return Resolution("clarify", entities, trace=trace | {"reason": "overlapping_group_targets"})
+    if power := power_permission(action, parameters):
+        leaf_ids = set(leaves)
+        blocked = [entity["id"] for entity in catalog if entity["id"] in leaf_ids and any(
+            item["id"] == power and item.get("configured", item["enabled"]) is not True for item in entity["actions"]
+        )]
+        if blocked:
+            return Resolution("no_action", entities, trace=trace | {"reason": "power_action_disabled", "rejected": blocked})
     if target_set != set(reference) and "reference" in trace:
         return Resolution("clarify", entities, trace=trace | {"reason": "reference_target_set_changed"})
-    result.steps = [ActionCandidate(action, members, schema, parameters, scope)]
-    result.adaptive = bool(parameters or any(len(leaves) != 1 or target not in leaves for target, leaves in members.items()) or trace.get("target_spans"))
-    return result
+    adaptive = bool(parameters or any(len(leaves) != 1 or target not in leaves for target, leaves in members.items()) or trace.get("target_spans"))
+    return Resolution(status, entities, enabled, bulk, [ActionCandidate(action, members, schema, parameters, scope, basis)], trace, adaptive)
 
 
-def _exclusion(prompt, catalog, language, reference):
+def _exclusion(prompt, catalog, language, reference, timings):
     leave = _LEAVE.search(prompt)
     marker = leave or _EXCLUSION.search(prompt)
     if not marker:
@@ -190,7 +274,7 @@ def _exclusion(prompt, catalog, language, reference):
     if state and not leave:
         start += f" {state[1]}"
         end = end[:state.start()]
-    included = _part(start, catalog, language, reference)
+    included = _part(start, catalog, language, reference, timings=timings)
     blocked = Resolution("clarify", included.entities, trace=included.trace | {"reason": "unresolved_exclusion"})
     if len(included.steps) != 1 or not included.bulk and not leave:
         return blocked
@@ -198,7 +282,7 @@ def _exclusion(prompt, catalog, language, reference):
     if leave and state:
         end = end[:state.start()]
     scope = catalog if leave else [entity for entity in catalog if entity["id"] in step.scope]
-    excluded, _, _, status = select_context(end, scope, language=language, strict=True)
+    excluded, _, _, status = select_context(end, scope, language=language, strict=True, timings=timings)
     location_only = re.fullmatch(r"(?:(?:der|die|den|das|the|those|ones?) )?(?:im|in(?: the| der| dem)?) .+", normalize(end))
     if location_only and status == "clarify" and excluded and len({entity.get("area_id", entity["area"]) for entity in excluded}) == 1:
         pass
@@ -228,26 +312,107 @@ def _exclusion(prompt, catalog, language, reference):
     return included
 
 
-def resolve(prompt, catalog, language, reference=()):
+_ALTERNATIVES = re.compile(r"^(?:wahlweise|either) (.+) (?:oder|or) (.+)$", re.I)
+_COMFORT = re.compile(r"^(?:mach(?:e)?|make) (.+) (?:gemütlicher|gemuetlicher|cozier|cosier)[.!?]*$", re.I)
+_HERE_LIGHT = re.compile(r"(?:schalte?|mache?) (?:hier (?:das licht|die lampen|die lichter)|(?:das licht|die lampen|die lichter) hier) (an|ein|aus)|(?:turn|switch) (?:the )?lights (on|off) here")
+_REPEAT_LIGHT = re.compile(r"(?:und|and) ((?:die|das|the) (?:lampe|leuchte|licht|lamp|light) (?:im|in|in der|in the) .+?) (?:auch|too)[.!]*$", re.I)
+_CHOICE_ACTIONS = frozenset({"light_set", "turn_on", "turn_off", "fan_set_percentage", "volume_set"})
+
+
+def _bounded(alternatives, catalog, language, *, reason="explicit_alternatives", timings=None):
+    branches = [_part(branch, catalog, language, (), keep_noops=True, timings=timings) for branch in alternatives]
+    entities = {entity["id"]: entity for branch in branches for entity in branch.entities}
+    trace = {"clauses": [branch.trace | {"status": branch.status, "text": text[:512]} for branch, text in zip(branches, alternatives)]}
+    if any(len(branch.steps) != 1 or branch.bulk or branch.trace.get("target_spans") or not branch.trace.get("names")
+           or any(evidence["method"] not in {"exact", "word_join"} for evidence in branch.trace["names"]) for branch in branches):
+        return Resolution("clarify", list(entities.values()), trace=trace | {"reason": "incomplete_bounded_choices"})
+    first, second = (branch.steps[0] for branch in branches)
+    if (first.targets != second.targets or len(first.targets) != 1
+        or not first.targets[0].startswith(("light.", "fan.", "media_player."))
+        or any(step.action not in _CHOICE_ACTIONS or step.members[first.targets[0]] != tuple(first.targets) for step in (first, second))
+        or (first.action, first.parameters) == (second.action, second.parameters)):
+        return Resolution("clarify", list(entities.values()), trace=trace | {"reason": "unsafe_or_duplicate_bounded_choices"})
+    target = entities[first.targets[0]]
+    if target.get("group") or any(spec.get("sensitive") for spec in target["actions"] if spec["id"] in {first.action, second.action}):
+        return Resolution("clarify", list(entities.values()), trace=trace | {"reason": "unsafe_bounded_target"})
+    return Resolution("bounded", [target], trace=trace | {"intent_source": reason}, choices=(BoundedChoice("option_1", first), BoundedChoice("option_2", second)))
+
+
+def target_alternatives(prompt, catalog, language, resolution):
+    trace = resolution.trace
+    entities = sorted(resolution.entities, key=lambda entity: entity["id"])
+    evidence = trace.get("names", ())
+    if (trace.get("reason") != "ambiguous_target" or trace.get("target_spans") or len(entities) != 2
+        or any(entity.get("group") or not entity["id"].startswith(("light.", "fan.", "media_player.")) for entity in entities)
+        or len(evidence) != 2 or len({match["heard"] for match in evidence}) != 1
+        or any(match["method"] != "exact" for match in evidence)
+        or len({(entity["name"], entity["area"]) for entity in entities}) != 2):
+        return ()
+    choices = []
+    for index, entity in enumerate(entities):
+        other = entities[1 - index]["id"]
+        result = _part(prompt, [candidate for candidate in catalog if candidate["id"] != other], language, (), keep_noops=True)
+        if len(result.steps) != 1 or result.bulk:
+            return ()
+        step = result.steps[0]
+        if (step.targets != [entity["id"]] or step.action not in _CHOICE_ACTIONS
+            or any(item.get("sensitive") for item in entity["actions"] if item["id"] == step.action)):
+            return ()
+        choices.append(BoundedChoice(f"option_{index + 1}", step))
+    if (choices[0].action.action, choices[0].action.parameters) != (choices[1].action.action, choices[1].action.parameters):
+        return ()
+    return tuple(choices)
+
+
+def resolve(prompt, catalog, language, reference=(), *, comfort=False, timings=None, voice_area=None, previous_action=None):
     normalized = normalize(prompt)
+    if local := _HERE_LIGHT.fullmatch(normalized):
+        if not voice_area:
+            return Resolution("clarify", [], trace={"reason": "unknown_voice_area"})
+        area_catalog = [entity for entity in catalog if entity.get("area_id") == voice_area]
+        power = "aus" if (local[1] or local[2]) in {"off", "aus"} else "an"
+        scoped = _part(f"schalte alle lichter {power}", area_catalog, language, (), timings=timings)
+        scoped.trace["voice_area"] = voice_area
+        return scoped
+    if repeat := _REPEAT_LIGHT.fullmatch(prompt.strip()):
+        if len(reference) == 1 and previous_action in {"turn_on", "turn_off"}:
+            power = "an" if previous_action == "turn_on" else "aus"
+            repeated = _part(f"schalte {repeat[1]} {power}", catalog, language, (), keep_noops=True, timings=timings)
+            if (len(repeated.steps) == 1 and not repeated.bulk and len(repeated.entities) == 1
+                and repeated.steps[0].targets[0].startswith("light.") and repeated.steps[0].targets[0] not in reference
+                and not repeated.entities[0].get("group") and repeated.trace.get("rooms")
+                and all(evidence["method"] in {"exact", "word_join"} for evidence in repeated.trace["rooms"])):
+                repeated.trace["reference_source"] = "last_executed_power_action"
+                return repeated
+        return Resolution("clarify", [], trace={"reason": "unresolved_repeat_action"})
     exclusion = _EXCLUSION.search(prompt) or _LEAVE.search(prompt)
     without_marker = normalize(prompt[:exclusion.start()] + " " + prompt[exclusion.end():]) if exclusion else normalized
     if _QUESTION.search(normalized) or _EXCEPTION.search(without_marker) or _DEFERRED.search(normalized):
-        return _part(prompt, catalog, language, reference)
+        return _part(prompt, catalog, language, reference, timings=timings)
+    if not exclusion and (alternatives := _ALTERNATIVES.fullmatch(prompt.strip())):
+        return _bounded(alternatives.groups(), catalog, language, timings=timings)
     if exclusion:
-        return _exclusion(prompt, catalog, language, reference)
+        return _exclusion(prompt, catalog, language, reference, timings)
     if re.search(r"^(?:(?:und|and|nein|no) )?(?:die andere|the other|die im|those in|auch|also)\b", normalized):
         return Resolution("clarify", [], trace={"reason": "ambiguous_reference"})
+    parsing_started = perf_counter()
     parts = list(_parts(prompt, catalog))
+    if timings is not None:
+        timings["clause_parsing_ms"] = (perf_counter() - parsing_started) * 1000
     if len(parts) == 1:
-        return _part(prompt, catalog, language, reference)
+        if comfort and (match := _COMFORT.fullmatch(prompt.strip())):
+            target = match[1]
+            interpreted = _bounded((f"set {target} brightness to 30 percent", f"set {target} to 2700 kelvin"), catalog, language, reason="configured_light_comfort", timings=timings)
+            if interpreted.choices and all(choice.action.action == "light_set" for choice in interpreted.choices):
+                return interpreted
+        return _part(prompt, catalog, language, reference, timings=timings)
     if len(parts) > MAX_STEPS or not all(parts):
         return Resolution("clarify", [], trace={"reason": "invalid_clause_count"})
     clauses, steps = [], []
     entities = {}
     for part in parts:
-        item = _part(part, catalog, language, reference, keep_noops=True)
-        clauses.append(item.trace | {"status": item.status})
+        item = _part(part, catalog, language, reference, previous_clause=bool(clauses), keep_noops=True, timings=timings)
+        clauses.append(item.trace | {"status": item.status, "text": part[:512]})
         entities.update((entity["id"], entity) for entity in item.entities if entity["id"] != BULK_TARGET)
         if item.status not in {"matched", "already_set"} or any(target["status"] == "not_allowed" for target in item.trace.get("scope", [])):
             return Resolution("clarify", list(entities.values()), trace={"reason": "incomplete_compound_plan", "clauses": clauses})

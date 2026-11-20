@@ -3,9 +3,11 @@
 import re
 import unicodedata
 from collections import defaultdict
+from functools import lru_cache
 from itertools import groupby
 
 _WORDS = re.compile(r"[a-z0-9]+")
+_NEXT_NUMBER = re.compile(r"\d+\b")
 _NUMBER_WORDS = dict(zip("null eins zwei drei vier funf sechs sieben acht neun zehn elf zwolf".split(), map(str, range(13))))
 _LOCATION = r"(?:im|in(?: dem| der| the)?|am|at(?: the)?|inside(?: the)?)"
 LOCATION_PREFIX = re.compile(rf"\b{_LOCATION} $")
@@ -89,6 +91,11 @@ def _within_edits(left, right, limit):
 MATCH_METHODS = ("exact", "word_join", "edit_distance", "phonetic")
 
 
+@lru_cache(maxsize=8192)
+def _alias_sound_keys(compact_name, rooms):
+    return tuple(_sound_keys(compact_name, rooms=rooms))
+
+
 def _specific(matches):
     phrases = {phrase for group in matches.values() for _, phrase in group}
     specific = {phrase for phrase in phrases if not any(other != phrase and contains(other, phrase) for other in phrases)}
@@ -96,9 +103,18 @@ def _specific(matches):
 
 
 def match_names(text, names, *, rooms=False, generic=(), german=True):
+    surrounded = f" {text} "
+
     def exact_match(variant):
-        # A bare name followed by a number can refer to a different numbered device.
-        return bool(variant and re.search(rf"(?<!\w){re.escape(variant)}(?!\w)(?! \d+\b)", text))
+        if not variant:
+            return False
+        needle = f" {variant} "
+        offset = surrounded.find(needle)
+        while offset >= 0:
+            if not _NEXT_NUMBER.match(surrounded, offset + len(needle)):
+                return True
+            offset = surrounded.find(needle, offset + 1)
+        return False
 
     exact = {key: {(0, variant) for variant in variants if variant not in generic and exact_match(variant)} for key, variants in names.items()}
     exact = {key: matches for key, matches in exact.items() if matches}
@@ -132,11 +148,11 @@ def match_names(text, names, *, rooms=False, generic=(), german=True):
             compact_name = variant.replace(" ", "")
             if compact_name in joined:
                 joined_matches[key].update((1, phrase) for phrase in joined[compact_name])
-            if not 5 <= len(compact_name) <= 48:
+            if not (sounds or edits) or not 5 <= len(compact_name) <= 48:
                 continue
             digits = tuple(re.findall(r"\d+", compact_name))
             if german:
-                for sound in _sound_keys(compact_name, rooms=rooms):
+                for sound in _alias_sound_keys(compact_name, rooms):
                     fuzzy_matches[key].update((3, phrase) for phrase in sounds.get((sound, digits), ()))
             if len(compact_name) < 6:
                 continue

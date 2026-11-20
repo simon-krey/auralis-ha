@@ -1,12 +1,34 @@
 """Policy tests use HA-shaped mocks; no service or device is contacted."""
 import asyncio
 import importlib.util
+from enum import IntFlag
+import sys
+import types
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("auralis_actions", Path(__file__).parents[1] / "custom_components/auralis/actions.py")
 actions = importlib.util.module_from_spec(spec)
+# Values copied from HA 2026.11.2 const.py for offline tests only.
+_FEATURE_STUBS = {
+    "alarm_control_panel": ("AlarmControlPanelEntityFeature", {"ARM_HOME": 1, "ARM_AWAY": 2}),
+    "climate": ("ClimateEntityFeature", {"TARGET_TEMPERATURE": 1}),
+    "cover": ("CoverEntityFeature", {"OPEN": 1, "CLOSE": 2, "SET_POSITION": 4, "STOP": 8}),
+    "fan": ("FanEntityFeature", {"SET_SPEED": 1, "OSCILLATE": 2, "TURN_OFF": 16, "TURN_ON": 32}),
+    "media_player": ("MediaPlayerEntityFeature", {"PAUSE": 1, "VOLUME_SET": 4, "PREVIOUS_TRACK": 16, "NEXT_TRACK": 32, "STOP": 4096, "PLAY": 16384}),
+    "siren": ("SirenEntityFeature", {"TURN_ON": 1, "TURN_OFF": 2}),
+    "valve": ("ValveEntityFeature", {"OPEN": 1, "CLOSE": 2, "SET_POSITION": 4, "STOP": 8}),
+    "vacuum": ("VacuumEntityFeature", {"PAUSE": 4, "RETURN_HOME": 16, "START": 8192}),
+}
+stubs = {}
+for domain, (name, values) in _FEATURE_STUBS.items():
+    module_name = f"homeassistant.components.{domain}.const"
+    module = types.ModuleType(module_name)
+    setattr(module, name, IntFlag(name, values))
+    stubs[module_name] = module
+sys.modules.update(stubs)
 spec.loader.exec_module(actions)
 ActionPolicy = actions.ActionPolicy
 
@@ -50,6 +72,41 @@ class PolicyTests(unittest.TestCase):
 
     def run_action(self, action, targets, params=None, **kw):
         return asyncio.run(self.policy.run(action, targets, {} if params is None else params, self.ctx, **kw))
+
+    def test_capabilities_and_trace(self):
+        rgb = state("light.rgb", supported_color_modes=["rgb"])
+        temperature = state("light.temp", supported_color_modes=["color_temp"], min_color_temp_kelvin=2000, max_color_temp_kelvin=6500)
+        fan = state("fan.test", supported_features=1)
+        self.assertIn("rgb_color", actions._capability(rgb, "light_set"))
+        self.assertNotIn("color_temp_kelvin", actions._capability(rgb, "light_set"))
+        self.assertEqual(actions._capability(temperature, "light_set")["color_temp_kelvin"], {"type": "number", "minimum": 2000, "maximum": 6500})
+        self.assertIsNotNone(actions._capability(fan, "fan_set_percentage"))
+        self.assertIsNone(actions._capability(fan, "fan_oscillate"))
+        trace = {}
+        self.assertEqual(self.policy.catalog(for_retrieval=True), self.policy.catalog(for_retrieval=True, trace=trace))
+        self.assertTrue(all(trace[key] >= 0 for key in ("catalog_state_ms", "catalog_registry_ms", "catalog_group_ms")))
+
+    def test_retrieval_location_metadata(self):
+        area = SimpleNamespace(id="kitchen", name="Kitchen", aliases={"Galley"})
+        floor = SimpleNamespace(floor_id="ground", name="Ground", aliases={"Downstairs"})
+        self.policy._area = lambda entity_id: area
+        self.policy._location_metadata = lambda area, entry: (None, floor)
+        entity = next(item for item in self.policy.catalog(for_retrieval=True) if item["id"] == "light.one")
+        self.assertEqual((entity["area_id"], entity["area_aliases"], entity["floor_id"], entity["floor_aliases"]), ("kitchen", {"Galley"}, "ground", {"Downstairs"}))
+
+    def test_device_inherited_area_supplies_floor(self):
+        area = SimpleNamespace(id="kitchen", name="Kitchen", floor_id="ground", aliases={"Galley"})
+        floor = SimpleNamespace(floor_id="ground", name="Ground", aliases={"Downstairs"})
+        device = SimpleNamespace(area_id=None, name_by_user=None, name="Lamp")
+        registry = SimpleNamespace(async_get=lambda device_id: device)
+        helpers = types.ModuleType("homeassistant.helpers")
+        helpers.device_registry = SimpleNamespace(async_get=lambda hass: registry, async_get_effective_area_id=lambda hass, item: "kitchen")
+        helpers.area_registry = SimpleNamespace(async_get=lambda hass: SimpleNamespace(async_get_area=lambda area_id: area))
+        helpers.floor_registry = SimpleNamespace(async_get=lambda hass: SimpleNamespace(async_get_floor=lambda floor_id: floor))
+        self.policy._registry_entry = lambda entity_id: SimpleNamespace(area_id=None, device_id="child", platform="test", aliases=(), id=entity_id)
+        with patch.dict(sys.modules, {"homeassistant.helpers": helpers}):
+            entity = next(item for item in self.policy.catalog(for_retrieval=True) if item["id"] == "light.one")
+        self.assertEqual((entity["area"], entity["floor"], entity["floor_aliases"]), ("Kitchen", "Ground", {"Downstairs"}))
 
     def test_dry_run_and_group_revalidation(self):
         self.overrides["light.two:turn_on"] = False
